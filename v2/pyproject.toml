@@ -16,3 +16,10 @@ indent-style = "space"
 docstring-code-format = true
 skip-magic-trailing-comma = false
 line-ending = "auto"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "...", url = "https://download.pytorch.org/whl/cu128" }
