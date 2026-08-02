@@ -1,0 +1,288 @@
+{
+  "task": "gsm8k",
+  "subset_percent": 5.0,
+  "original": {
+    "metrics": {
+      "alias": "gsm8k",
+      "exact_match,strict-match": 0.0,
+      "exact_match_stderr,strict-match": 0.0,
+      "exact_match,flexible-extract": 0.8181818181818182,
+      "exact_match_stderr,flexible-extract": 0.04783952832583798
+    },
+    "tflops": 4016.088129994752,
+    "total_generated_tokens": 21758,
+    "total_generation_time": 361.31810426712036,
+    "tokens_per_second": 60.2184051754972,
+    "flops_summary": {
+      "policy_name": "original",
+      "block_size": 32,
+      "prefill_steps": 66,
+      "full_block_steps": 4253,
+      "subblock_steps": 17503,
+      "sparse_steps": 0,
+      "cosine_token_pairs": 0,
+      "decoder_flops": 3709049688293376.0,
+      "lm_head_flops": 307038441701376.0,
+      "cosine_flops": 0.0,
+      "total_flops": 4016088129994752.0
+    }
+  },
+  "policies": [
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 1,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.0,
+        "exact_match_stderr,strict-match": 0.0,
+        "exact_match,flexible-extract": 0.7727272727272727,
+        "exact_match_stderr,flexible-extract": 0.05197926135426053
+      },
+      "tflops": 3318.796942035498,
+      "total_generated_tokens": 21534,
+      "total_generation_time": 389.71975231170654,
+      "tokens_per_second": 55.25509002883854,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 1781,
+        "subblock_steps": 0,
+        "sparse_steps": 19603,
+        "cosine_token_pairs": 5969159,
+        "decoder_flops": 3057375003475968.0,
+        "lm_head_flops": 261293541949440.0,
+        "cosine_flops": 128396610090.0,
+        "total_flops": 3318796942035498.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 2,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.0,
+        "exact_match_stderr,strict-match": 0.0,
+        "exact_match,flexible-extract": 0.696969696969697,
+        "exact_match_stderr,flexible-extract": 0.057002420795512765
+      },
+      "tflops": 3264.82103563316,
+      "total_generated_tokens": 23359,
+      "total_generation_time": 402.4967203140259,
+      "tokens_per_second": 58.0352554966794,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 1622,
+        "subblock_steps": 0,
+        "sparse_steps": 20549,
+        "cosine_token_pairs": 5790124,
+        "decoder_flops": 3007295319375872.0,
+        "lm_head_flops": 257401170690048.0,
+        "cosine_flops": 124545567240.0,
+        "total_flops": 3264821035633160.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 3,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.015151515151515152,
+        "exact_match_stderr,strict-match": 0.015151515151515148,
+        "exact_match,flexible-extract": 0.7121212121212122,
+        "exact_match_stderr,flexible-extract": 0.05615974350262313
+      },
+      "tflops": 2946.225939433632,
+      "total_generated_tokens": 22078,
+      "total_generation_time": 355.3173818588257,
+      "tokens_per_second": 62.135997638224204,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 1516,
+        "subblock_steps": 0,
+        "sparse_steps": 18086,
+        "cosine_token_pairs": 5194096,
+        "decoder_flops": 2713386164944896.0,
+        "lm_head_flops": 232728049483776.0,
+        "cosine_flops": 111725004960.0,
+        "total_flops": 2946225939433632.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 4,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.0,
+        "exact_match_stderr,strict-match": 0.0,
+        "exact_match,flexible-extract": 0.5757575757575758,
+        "exact_match_stderr,flexible-extract": 0.06130137276858361
+      },
+      "tflops": 3103.869645179264,
+      "total_generated_tokens": 24800,
+      "total_generation_time": 362.10666489601135,
+      "tokens_per_second": 68.48810697014369,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 1756,
+        "subblock_steps": 0,
+        "sparse_steps": 18100,
+        "cosine_token_pairs": 5409856,
+        "decoder_flops": 2859123576995840.0,
+        "lm_head_flops": 244629702180864.0,
+        "cosine_flops": 116366002560.0,
+        "total_flops": 3103869645179264.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 5,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.030303030303030304,
+        "exact_match_stderr,strict-match": 0.021262012589261328,
+        "exact_match,flexible-extract": 0.5454545454545454,
+        "exact_match_stderr,flexible-extract": 0.061760565498796154
+      },
+      "tflops": 4398.388309864378,
+      "total_generated_tokens": 39529,
+      "total_generation_time": 499.08024764060974,
+      "tokens_per_second": 79.2036955717491,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 2959,
+        "subblock_steps": 0,
+        "sparse_steps": 24134,
+        "cosine_token_pairs": 7504031,
+        "decoder_flops": 4053120389742592.0,
+        "lm_head_flops": 345106508414976.0,
+        "cosine_flops": 161411706810.0,
+        "total_flops": 4398388309864378.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 6,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.015151515151515152,
+        "exact_match_stderr,strict-match": 0.01515151515151514,
+        "exact_match,flexible-extract": 0.3333333333333333,
+        "exact_match_stderr,flexible-extract": 0.0584705346204686
+      },
+      "tflops": 5128.503280442814,
+      "total_generated_tokens": 50383,
+      "total_generation_time": 568.6627838611603,
+      "tokens_per_second": 88.59908091383218,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 3711,
+        "subblock_steps": 0,
+        "sparse_steps": 27209,
+        "cosine_token_pairs": 8609525,
+        "decoder_flops": 4726588533768192.0,
+        "lm_head_flops": 401729555791872.0,
+        "cosine_flops": 185190882750.0,
+        "total_flops": 5128503280442814.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 7,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.030303030303030304,
+        "exact_match_stderr,strict-match": 0.021262012589261317,
+        "exact_match,flexible-extract": 0.22727272727272727,
+        "exact_match_stderr,flexible-extract": 0.051979261354260516
+      },
+      "tflops": 6707.086249220834,
+      "total_generated_tokens": 74782,
+      "total_generation_time": 683.3675403594971,
+      "tokens_per_second": 109.43159512765219,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 5597,
+        "subblock_steps": 0,
+        "sparse_steps": 31043,
+        "cosine_token_pairs": 10971771,
+        "decoder_flops": 6187429597282304.0,
+        "lm_head_flops": 519420649144320.0,
+        "cosine_flops": 236002794210.0,
+        "total_flops": 6707086249220834.0
+      }
+    },
+    {
+      "config": {
+        "token_threshold": 0.99,
+        "token_freeze_step": 8,
+        "layer_threshold": 0.95,
+        "layer_freeze_step": 2
+      },
+      "metrics": {
+        "alias": "gsm8k",
+        "exact_match,strict-match": 0.030303030303030304,
+        "exact_match_stderr,strict-match": 0.021262012589261324,
+        "exact_match,flexible-extract": 0.25757575757575757,
+        "exact_match_stderr,flexible-extract": 0.0542402755105653
+      },
+      "tflops": 7140.796712329236,
+      "total_generated_tokens": 79840,
+      "total_generation_time": 832.2882099151611,
+      "tokens_per_second": 95.92830830577121,
+      "flops_summary": {
+        "policy_name": "layer_and_token_policy",
+        "block_size": 32,
+        "prefill_steps": 66,
+        "full_block_steps": 5042,
+        "subblock_steps": 0,
+        "sparse_steps": 40063,
+        "cosine_token_pairs": 11671214,
+        "decoder_flops": 6581025198440448.0,
+        "lm_head_flops": 559520466075648.0,
+        "cosine_flops": 251047813140.0,
+        "total_flops": 7140796712329236.0
+      }
+    }
+  ]
+}

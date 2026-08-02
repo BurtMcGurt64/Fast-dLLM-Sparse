@@ -1,0 +1,8 @@
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Problem:
+How many vertical asymptotes does the graph of $y=\frac{2}{x^2+x-6}$ have?
+
+Please reason step by step, and put your final answer within \boxed{{}}.<|im_end|>
+<|im_start|>assistant

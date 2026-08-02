@@ -13,6 +13,12 @@ eval_outputs/
 .venv/
 venv/
 *.egg-info/
+
+# Sparse-dllm demo media (large, not needed for code)
+Sparse-dllm/asset/
+Sparse-dllm/v2/asset/
+*.mp4
+*.gif
 dist/
 build/
 .pytest_cache/
