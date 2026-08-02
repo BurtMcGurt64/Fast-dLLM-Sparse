@@ -27,6 +27,16 @@ from einops import rearrange, repeat
 
 logger = logging.get_logger(__name__)
 
+# Optional Triton kernel for per-sequence top-K block attention.
+# Imported lazily so the model loads even without the kernel file present.
+try:
+    import os as _os, sys as _sys
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), ".."))
+    from kernels.topk_block_attn import topk_block_attn as _topk_kernel
+    _TOPK_KERNEL_AVAILABLE = True
+except Exception:
+    _TOPK_KERNEL_AVAILABLE = False
+
 
 @dataclass
 class CausalLMOutputWithPastAndBlockCache(CausalLMOutputWithPast):
@@ -227,42 +237,96 @@ class Fast_dLLM_QwenAttention(nn.Module):
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             elif len(past_key_value) > self.layer_idx:
-                key_states = torch.cat((past_key_value[self.layer_idx][0], key_states), dim=-2)
-                value_states = torch.cat((past_key_value[self.layer_idx][1], value_states), dim=-2)
+                prefix_k = past_key_value[self.layer_idx][0]
+                prefix_v = past_key_value[self.layer_idx][1]
+
+                # top-K block loading: if armed, slice prefix to selected token positions only
+                _idx = getattr(self, '_topk_token_indices', None)
+                if _idx is not None:
+                    prefix_len = prefix_k.shape[-2]
+                    if _idx.dim() == 1:
+                        # Legacy union mode: same 1D index for all sequences
+                        _idx = _idx[_idx < prefix_len]
+                        if len(_idx) < prefix_len:
+                            prefix_k = prefix_k[:, :, _idx, :]
+                            prefix_v = prefix_v[:, :, _idx, :]
+                            if attention_mask is not None:
+                                prefix_mask = attention_mask[..., :prefix_len][..., _idx]
+                                block_mask  = attention_mask[..., prefix_len:]
+                                attention_mask = torch.cat([prefix_mask, block_mask], dim=-1)
+                    else:
+                        # Per-sequence mode: _idx is [B, K_tokens]
+                        K_tokens = _idx.shape[1]
+                        B_match = (_idx.shape[0] == prefix_k.shape[0])
+                        if B_match and K_tokens < prefix_len:
+                            safe_idx = _idx.clamp(max=prefix_len - 1)
+                            idx_exp = safe_idx.unsqueeze(1).unsqueeze(-1).expand(
+                                -1, prefix_k.shape[1], -1, prefix_k.shape[-1]
+                            )
+                            prefix_k = torch.gather(prefix_k, dim=2, index=idx_exp)
+                            prefix_v = torch.gather(prefix_v, dim=2, index=idx_exp)
+                            # Prefix mask is always 0.0 (attend) for block-aligned prefill.
+                            # Reconstruct mask with the right number of prefix columns.
+                            if attention_mask is not None:
+                                block_mask = attention_mask[..., prefix_len:]
+                                prefix_zero = attention_mask.new_zeros(
+                                    *attention_mask.shape[:-1], K_tokens
+                                )
+                                attention_mask = torch.cat([prefix_zero, block_mask], dim=-1)
+                        # else: batch shrank (finished seqs removed) or K >= prefix_len
+                        # — fall back to full prefix for this step, no gather
+                key_states = torch.cat((prefix_k, key_states), dim=-2)
+                value_states = torch.cat((prefix_v, value_states), dim=-2)
 
         if self.training:
             attn_output = fused_flex_attention(query_states, key_states, value_states, mask=attention_mask)
             attn_output = attn_output.transpose(1, 2).contiguous()
-        elif getattr(self, '_capture_attn_scores', False):
-            # Manual attention path used during commit steps for top-K block selection.
-            # Replaces SDPA so we can access per-token attention weights.
-            # GQA: expand KV heads from n_kv_heads=4 to n_heads=28.
-            k_exp = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            v_exp = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            scores = torch.matmul(query_states, k_exp.transpose(-1, -2)) * self.scaling
-            if attention_mask is not None:
-                scores = scores + attention_mask
-            attn_weights = torch.softmax(scores.float(), dim=-1).to(query_states.dtype)
-            attn_output = torch.matmul(attn_weights, v_exp)
-            attn_output = attn_output.transpose(1, 2).contiguous()
-            # Aggregate across heads and query positions — only [kv_len] floats stored per layer.
-            # batch_sample reads this after the commit-step forward call.
-            self._last_token_scores = attn_weights.mean(dim=(0, 1, 2)).detach()  # [kv_len]
         else:
-            attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
-
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
+            # Direct SDPA with enable_gqa=True: avoids repeat_kv expansion.
+            # HF's sdpa_attention_forward only passes enable_gqa when mask is None;
+            # we pass it unconditionally — PyTorch 2.5+ Flash handles GQA + custom masks.
+            # Saves ~30 GB peak memory at B=32/8k vs expanding K/V from H_kv=4 to H_q=28.
+            _mask = attention_mask
+            if _mask is not None and _mask.dim() == 2:
+                _mask = _mask.unsqueeze(0).unsqueeze(0)  # [1, 1, L_q, L_kv]
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_states, value_states,
+                attn_mask=_mask,
+                dropout_p=0.0 if not self.training else self.attention_dropout,
                 is_causal=False,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,  # main diff with Llama
-                **kwargs,
-            )
+                scale=self.scaling,
+                enable_gqa=True,
+            )  # [B, H_q, L_q, d]
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_weights = None
+
+        # Store mean commit-step query for Top-K block scoring (TopKBlockLoader).
+        # Activated only during commit steps. We store the mean query vector
+        # (averaged over GQA groups and query positions) per KV head — tiny
+        # [B, H_kv, d] tensor — so the TopKBlockLoader can compute query-weighted
+        # block importance scores after the commit forward returns.
+        if not self.training and getattr(self, '_capture_attn_scores', False):
+            with torch.no_grad():
+                H_kv = key_states.shape[1]
+                GQA  = query_states.shape[1] // H_kv
+                self._commit_query_mean = query_states.detach().float().reshape(
+                    query_states.shape[0], H_kv, GQA,
+                    query_states.shape[2], query_states.shape[3]
+                ).mean(dim=(2, 3))  # [B, H_kv, d]
+
+        # TRUE per-position attention MASS capture (for attention-structure analysis).
+        # Off by default; only at small steps (attention_mask is None) so it stays cheap
+        # and shows the denoising-trajectory prefix attention. Stores [B, L_kv] = mean
+        # softmax mass each key position receives, averaged over heads and query positions.
+        if (not self.training and getattr(self, '_capture_block_mass', False)
+                and attention_mask is None):
+            with torch.no_grad():
+                Hq, Hkv = query_states.shape[1], key_states.shape[1]
+                kexp = key_states.repeat_interleave(Hq // Hkv, dim=1)  # [B, Hq, L_kv, d]
+                logits = torch.matmul(query_states.float(),
+                                      kexp.float().transpose(-1, -2)) * self.scaling
+                attn = torch.softmax(logits, dim=-1)                   # [B, Hq, L_q, L_kv]
+                self._block_mass = attn.mean(dim=(1, 2)).detach().cpu()  # [B, L_kv]
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

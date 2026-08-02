@@ -34,7 +34,7 @@ class Fast_dLLM_QwenForCausalLM:
         batch_size = input_ids.shape[0]
 
         if min_len > block_size:
-            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+            output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size, logits_to_keep=1)
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
                 predict_sample_idx = (seq_len == min_len)
@@ -154,6 +154,13 @@ class Fast_dLLM_QwenForCausalLM:
                     past_key_values.key_cache[layer_id] = past_key_values.key_cache[layer_id][~finished_flag]
                     past_key_values.value_cache[layer_id] = past_key_values.value_cache[layer_id][~finished_flag]
 
+                for layer in self.model.layers:
+                    attn = layer.self_attn
+                    if getattr(attn, '_topk_token_indices', None) is not None:
+                        attn._topk_token_indices = attn._topk_token_indices[~finished_flag]
+                    if getattr(attn, '_topk_block_ids', None) is not None:
+                        attn._topk_block_ids = attn._topk_block_ids[~finished_flag]
+
                 finished_flag = finished_flag[~finished_flag]
 
 
@@ -193,7 +200,7 @@ class Fast_dLLM_QwenForCausalLM:
         initial_state = []
 
         if input_ids.shape[1] > block_size:
-            output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True)
+            output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True, logits_to_keep=1)
             logits, past_key_values = output.logits, output.past_key_values
             nfe += 1
             if input_ids.shape[1] % block_size == 0:
