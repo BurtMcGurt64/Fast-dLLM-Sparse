@@ -25,8 +25,9 @@ from nfe_probe_stage1 import EVALS               # few-shot gsm8k harness (dense
 from ffn_skip import FFNSkipper
 
 GRID = {
-    "cosine": [1e-3, 5e-3, 1e-2, 5e-2],
-    "l2":     [1e-2, 5e-2, 1e-1, 2e-1],
+    "cosine":     [1e-3, 5e-3, 1e-2, 5e-2],
+    "l2":         [1e-2, 5e-2, 1e-1, 2e-1],
+    "confidence": [0.90, 0.95, 0.99],       # FREE baseline: lock when predicted-token conf >= thr
 }
 
 
