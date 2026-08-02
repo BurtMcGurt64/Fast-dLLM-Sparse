@@ -385,6 +385,14 @@ class Fast_dLLM_QwenRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        if self.rope_type not in ROPE_INIT_FUNCTIONS:
+            # this transformers build omits "default"; register standard RoPE inline
+            def _default_rope_init(config, device=None, **kwargs):
+                head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+                theta = getattr(config, "rope_theta", 10000.0)
+                inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+                return inv_freq, 1.0
+            ROPE_INIT_FUNCTIONS["default"] = _default_rope_init
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
