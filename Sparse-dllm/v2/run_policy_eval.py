@@ -1,15 +1,18 @@
 """
-Standalone driver for Xinze's token-policy method — NO lm_eval (bypasses the harness version drift).
-Measures GSM8K accuracy + wall-clock tok/s for ORG vs token-policy, with cosine vs l2 staleness.
+Standalone driver for Xinze's token-policy method — NO lm_eval. Measures GSM8K accuracy +
+wall-clock tok/s + skip-fraction for ORG vs token-policy, across cosine/l2 and BATCH SIZES.
 
-Run from Sparse-dllm/v2/ (venv active, LD_LIBRARY_PATH set), e.g.:
-    CUDA_VISIBLE_DEVICES=<gpu> python run_policy_eval.py --n 60 --gen 256
+The batch sweep is the batch-union deliverable: skip-fraction should FALL as batch grows (a position
+is skipped only if frozen in ALL sequences). Requires the token-policy sampler extended to batch>1
+(union of active positions) with self._tp_active / self._tp_total counters.
+
+Run from Sparse-dllm/v2/ (venv active, LD_LIBRARY_PATH set):
+    CUDA_VISIBLE_DEVICES=<gpu> python run_policy_eval.py --n 64 --gen 256 --batch_sizes 1,4,8,16
 """
 import sys, os, types, re, time, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 
-# --- main-repo compat patch: this model's DynamicCache uses .layers[i].keys/values ---
 from transformers.cache_utils import DynamicCache
 DynamicCache.__getitem__ = lambda self, i: (self.layers[i].keys, self.layers[i].values)
 class _LayerProxy:
@@ -33,7 +36,7 @@ Answer: Per minute she earns 12/60 = $0.2. For 50 minutes she earned 0.2 * 50 = 
 Question: Betty is saving for a $100 wallet. She has half the money she needs. Her parents give her $15 and her grandparents twice as much as her parents. How much more does she need?
 Answer: Betty has 100/2 = $50. Grandparents give 15*2 = $30. Now she has 50+15+30 = $95. She needs 100-95 = $5 more. #### 5
 
-Question: Julie is reading a 120-page book. Yesterday she read 12 pages and today twice as many. If she wants to read half the remaining pages tomorrow, how many should she read?
+Question: Julie is reading a 120-page book. Yesterday she read 12 pages and today twice as many. If she reads half the remaining pages tomorrow, how many should she read?
 Answer: Today she read 12*2 = 24. So far 12+24 = 36. Remaining 120-36 = 84. Half is 84/2 = 42. #### 42
 
 """
@@ -46,37 +49,56 @@ def pred(t):
     n = re.findall(r"-?[\d,]+", t); return n[-1].replace(",", "") if n else None
 
 
+def make_batches(data, tok, bs, device):
+    pad = tok.pad_token_id if tok.pad_token_id is not None else 151645
+    tok.pad_token = tok.pad_token or tok.eos_token
+    out = []
+    for i in range(0, len(data), bs):
+        chunk = data[i:i + bs]
+        encs = [tok(GSM8K_FEWSHOT + f"Question: {q}\nAnswer:", return_tensors="pt").input_ids[0] for q, _ in chunk]
+        lens = [e.shape[0] for e in encs]
+        L = max(lens)
+        ids = torch.full((len(encs), L), pad, dtype=torch.long)
+        for j, e in enumerate(encs):
+            ids[j, L - e.shape[0]:] = e            # left-pad
+        out.append((ids.to(device), torch.tensor(lens, device=device), min(lens),
+                    [g for _, g in chunk]))
+    return out
+
+
 @torch.no_grad()
-def run(model, tok, sampler, data, device, gen, **pk):
-    correct, ntok = 0, 0
+def run(model, tok, sampler, batches, device, gen, **pk):
+    correct = total = ntok = 0
     torch.cuda.synchronize(device); t0 = time.perf_counter()
-    for q, g in data:
-        ids = tok(GSM8K_FEWSHOT + f"Question: {q}\nAnswer:", return_tensors="pt").input_ids.to(device)
-        plen = ids.shape[1]
+    for ids, seq_len, min_len, golds in batches:
         out = sampler(input_ids=ids, tokenizer=tok, block_size=32, max_new_tokens=gen,
-                      small_block_size=8, min_len=plen,
-                      seq_len=torch.tensor([plen], device=device),
+                      small_block_size=8, min_len=min_len, seq_len=seq_len,
                       threshold=0.95, temperature=0.0, use_block_cache=True, **pk)
-        seq = out[0] if not isinstance(out, tuple) else out[0][0]
-        g_ids = seq[plen:]
-        ntok += int((g_ids != tok.pad_token_id).sum()) if tok.pad_token_id is not None else g_ids.numel()
-        correct += int((lambda p: p is not None and p == g)(pred(tok.decode(g_ids, skip_special_tokens=True))))
+        seq = out[0] if isinstance(out, tuple) else out
+        for b in range(seq.shape[0]):
+            g_ids = seq[b, ids.shape[1]:]
+            ntok += int((g_ids != tok.pad_token_id).sum()) if tok.pad_token_id is not None else g_ids.numel()
+            p = pred(tok.decode(g_ids, skip_special_tokens=True))
+            correct += int(p is not None and p == golds[b]); total += 1
     torch.cuda.synchronize(device); dt = time.perf_counter() - t0
-    return correct / len(data), ntok / dt
+    skip = 1.0 - (getattr(model, "_tp_active", 0) / max(1, getattr(model, "_tp_total", 0)))
+    return correct / total, ntok / dt, skip
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Efficient-Large-Model/Fast_dLLM_v2_7B")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--n", type=int, default=60)
+    p.add_argument("--n", type=int, default=64)
     p.add_argument("--gen", type=int, default=256)
     p.add_argument("--freeze", type=int, default=3)
+    p.add_argument("--batch_sizes", default="1,4,8,16")
+    p.add_argument("--metric", default="l2", choices=["cosine", "l2"])
+    p.add_argument("--thr", type=float, default=0.02, help="freeze threshold (l2~0.02, cosine~0.99)")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
-    # from_pretrained SILENTLY SKIPS weight loading for this model -> manual load_state_dict.
-    print("Loading model (manual state_dict load)...", flush=True)
+    print("Loading model (manual state_dict)...", flush=True)
     import json
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
@@ -99,29 +121,22 @@ def main():
 
     org = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample, model)
     tokp = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample_token_policy_flashattention, model)
+    GF.set_staleness_metric(args.metric)
 
-    print(f"\nORG baseline (few-shot, n={args.n})...", flush=True)
-    org_acc, org_tps = run(model, tok, org, data, args.device, args.gen)
-    print(f"  ORG  acc={org_acc:.3f}  tok/s={org_tps:.1f}", flush=True)
-
-    GRID = {"cosine": [0.95, 0.99], "l2": [0.02, 0.05, 0.1]}
-    rows = []
-    for metric, thrs in GRID.items():
-        GF.set_staleness_metric(metric)
-        for thr in thrs:
-            acc, tps = run(model, tok, tokp, data, args.device, args.gen,
-                           token_policy_threshold=thr, token_policy_freeze_step=args.freeze)
-            spd = tps / org_tps if org_tps else 0.0
-            rows.append((metric, thr, acc, tps, spd))
-            print(f"  token/{metric} thr={thr:<6} acc={acc:.3f}  tok/s={tps:.1f}  "
-                  f"speedup={spd:.2f}x  drop={org_acc-acc:+.3f}", flush=True)
-
-    print(f"\n{'='*66}\nTOKEN POLICY: ORG acc={org_acc:.3f} tok/s={org_tps:.1f} (GSM8K n={args.n})\n{'='*66}")
-    print(f"  {'metric':>7} {'thr':>6} {'acc':>7} {'tok/s':>8} {'speedup':>8} {'drop':>7}")
-    for m, thr, acc, tps, spd in rows:
-        print(f"  {m:>7} {thr:>6} {acc:>7.3f} {tps:>8.1f} {spd:>7.2f}x {org_acc-acc:>+7.3f}")
-    print("\n  Read: which metric holds accuracy at the highest speedup. Wall-clock speedup at")
-    print("  batch=1 will be modest (memory-bound); the accuracy/skip tradeoff is the main signal.")
+    print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}), GSM8K n={args.n}\n"
+          f"(accuracy at bs>1 may be unreliable — ragged prompts; skip-fraction + tok/s are the signal)")
+    print(f"  {'bs':>3} {'ORG t/s':>8} {'pol t/s':>8} {'speedup':>8} {'skip%':>6} {'ORG acc':>8} {'pol acc':>8}")
+    for bs in [int(x) for x in args.batch_sizes.split(",")]:
+        batches = make_batches(data, tok, bs, args.device)
+        org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen)
+        acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen,
+                             token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
+        spd = tps / org_tps if org_tps else 0.0
+        print(f"  {bs:>3} {org_tps:>8.1f} {tps:>8.1f} {spd:>7.2f}x {skip:>5.0%} {org_acc:>8.3f} {acc:>8.3f}",
+              flush=True)
+    print("\n  Read: does skip% hold as bs grows, and does speedup ever exceed 1? If skip% collapses")
+    print("  with batch (batch-union) or speedup stays <=1, the union approach is capped -> a ragged")
+    print("  (varlen) kernel would be needed for real per-sequence saving.")
 
 
 if __name__ == "__main__":
