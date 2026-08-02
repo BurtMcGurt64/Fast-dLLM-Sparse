@@ -75,9 +75,22 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
-    print("Loading model...", flush=True)
-    model = Fast_dLLM_QwenForCausalLM.from_pretrained(args.model, trust_remote_code=True,
-                                                      torch_dtype=torch.bfloat16).to(args.device).eval()
+    # from_pretrained SILENTLY SKIPS weight loading for this model -> manual load_state_dict.
+    print("Loading model (manual state_dict load)...", flush=True)
+    import json
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+    from model.configuration import Fast_dLLM_QwenConfig
+    snap = snapshot_download(args.model, local_files_only=True)
+    config = Fast_dLLM_QwenConfig.from_pretrained(snap)
+    model = Fast_dLLM_QwenForCausalLM(config).to(torch.bfloat16)
+    with open(os.path.join(snap, "model.safetensors.index.json")) as f:
+        index = json.load(f)
+    sd = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        sd.update(load_file(os.path.join(snap, shard), device="cpu"))
+    model.load_state_dict(sd, strict=True)
+    model = model.to(args.device).eval()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     from datasets import load_dataset
