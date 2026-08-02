@@ -729,9 +729,10 @@ class Fast_dLLM_QwenForCausalLM:
         """
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
-        if batch_size != 1:
-            # Sparse token-policy is implemented for single-request decoding.
-            raise ValueError("batch_sample_token_policy_flashattention currently supports batch_size=1 only.")
+        # batch>1 supported via union of active positions across sequences (batch-union: a position is
+        # skipped only if frozen in ALL sequences). Skip-fraction counters (reset per call):
+        self._tp_active = 0
+        self._tp_total = 0
         num_layers = self.config.num_hidden_layers
         if estimate_flops and getattr(self, "_decode_flops_estimator", None) is None:
             _reset_decode_flops_estimator(self, "token_policy", block_size)
@@ -789,9 +790,11 @@ class Fast_dLLM_QwenForCausalLM:
             x_init[finished_flag, -block_size:] = tokenizer.pad_token_id
             x_t = x_init.clone()
 
-            # Token-policy state for current block.
-            freeze_steps_left = torch.zeros((block_size,), device=self.device, dtype=torch.long)
-            prev_hidden = [None] * block_size
+            # Token-policy state for current block (per sequence).
+            freeze_steps_left = torch.zeros((batch_size, block_size), device=self.device, dtype=torch.long)
+            prev_hidden = torch.zeros((batch_size, block_size, self.config.hidden_size),
+                                      device=self.device, dtype=self.dtype)
+            prev_valid = torch.zeros((batch_size, block_size), device=self.device, dtype=torch.bool)
             cached_hidden = None
             cached_logits = None
             block_past_key_values = None
@@ -881,7 +884,7 @@ class Fast_dLLM_QwenForCausalLM:
                             # now, we don't reinitialize the cache but instead update it using sparse forard
                             # First subblock token still masked: refresh using active positions only.
                             block_tokens = x_t[:, -block_size:]
-                            active_positions = (freeze_steps_left == 0).nonzero().flatten()
+                            active_positions = (freeze_steps_left == 0).any(dim=0).nonzero().flatten()  # union across batch
                             decoder_tokens_this_step = int(active_positions.numel())
                             if active_positions.numel() > 0:
                                 output = self.forward_block_positions(
@@ -904,7 +907,7 @@ class Fast_dLLM_QwenForCausalLM:
                                 updated_positions = active_positions.tolist()
                         elif use_block_cache:
                             # Sparse forward: update active positions limited to current subblock.
-                            active_positions = (freeze_steps_left == 0).nonzero().flatten()
+                            active_positions = (freeze_steps_left == 0).any(dim=0).nonzero().flatten()  # union across batch
                             active_positions = active_positions[
                                 (active_positions >= small_block_start_idx)
                                 & (active_positions < small_block_end_idx)
@@ -931,7 +934,7 @@ class Fast_dLLM_QwenForCausalLM:
                                 updated_positions = active_positions.tolist()
                         else:
                             # use_block_cache=False: sparse forward across all active positions in the block.
-                            active_positions = (freeze_steps_left == 0).nonzero().flatten()
+                            active_positions = (freeze_steps_left == 0).any(dim=0).nonzero().flatten()  # union across batch
                             # print(
                             #     f"[token_policy] active tokens number={int(active_positions.numel())}"
                             # )
@@ -953,15 +956,26 @@ class Fast_dLLM_QwenForCausalLM:
                                 cached_logits[:, active_positions, :] = output.logits.detach()
                                 updated_positions = active_positions.tolist()
 
-                        # Update token policy based on cosine similarity for updated positions.
-                        for pos in updated_positions:
-                            cur = cached_hidden[0, pos]
-                            if prev_hidden[pos] is not None:
-                                cosine_pairs_this_step += 1
-                                if _token_is_stable(prev_hidden[pos].float(), cur.float(), token_policy_threshold):
-                                    # Mark token to be frozen for upcoming decoding steps.
-                                    newly_frozen_positions.append(pos)
-                            prev_hidden[pos] = cur.detach().clone()
+                        # Update token policy: per-(sample, position) staleness for updated positions (vectorized).
+                        newly_frozen_mask = torch.zeros((batch_size, block_size), device=self.device, dtype=torch.bool)
+                        if updated_positions:
+                            idx = torch.as_tensor(updated_positions, device=self.device, dtype=torch.long)
+                            cur = cached_hidden[:, idx, :].float()       # [B, nu, D]
+                            prev = prev_hidden[:, idx, :].float()        # [B, nu, D]
+                            valid = prev_valid[:, idx]                   # [B, nu]
+                            if _STALENESS_METRIC == "l2":
+                                change = (cur - prev).norm(dim=-1) / prev.norm(dim=-1).clamp_min(1e-6)
+                                stable = change < token_policy_threshold
+                            else:
+                                stable = torch.nn.functional.cosine_similarity(cur, prev, dim=-1) > token_policy_threshold
+                            stable = stable & valid                      # [B, nu]
+                            newly_frozen_mask[:, idx] = stable
+                            cosine_pairs_this_step += int(valid.sum().item())
+                            prev_hidden[:, idx, :] = cached_hidden[:, idx, :].detach()
+                            prev_valid[:, idx] = True
+                        if decoder_tokens_this_step > 0:                 # skip-fraction accounting (batch-union)
+                            self._tp_active += decoder_tokens_this_step
+                            self._tp_total += block_size
 
                         if decoder_tokens_this_step > 0:
                             if estimate_flops:
@@ -993,15 +1007,11 @@ class Fast_dLLM_QwenForCausalLM:
                         finished_row_flags = ((x_1 == stop_token) & unmask_idx).any(dim=1)
                         finished_flag = finished_flag | finished_row_flags
 
-                        # Consume one freeze step only after an actual decode step happened.
+                        # Consume one freeze step, then apply new freezes (N = N future steps).
                         freeze_steps_left = torch.where(
                             freeze_steps_left > 0, freeze_steps_left - 1, freeze_steps_left
                         )
-                        # Apply new freezes after consuming current-step budget so N means N future steps.
-                        if newly_frozen_positions:
-                            freeze_steps_left[
-                                torch.tensor(newly_frozen_positions, device=self.device, dtype=torch.long)
-                            ] = token_policy_freeze_step
+                        freeze_steps_left[newly_frozen_mask] = token_policy_freeze_step
                         # print(
                         #     f"[token_policy] freeze_steps_left={freeze_steps_left.tolist()}"
                         # )
