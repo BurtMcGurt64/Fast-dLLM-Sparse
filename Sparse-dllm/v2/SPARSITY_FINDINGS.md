@@ -1,161 +1,173 @@
-# Sparsity in Fast-dLLM v2 (block diffusion) — Token-level & KV-level, batched (b>1)
+# Sparsity in Fast-dLLM v2 — Token-level & KV-level Decoding (batched, b>1)
 
-Summary of the token-policy + KV-streaming sparsity study on **Fast-dLLM v2 7B** (Qwen2.5-7B backbone,
-block diffusion, 32-token blocks). Measured on **RTX PRO 6000 (94 GB)**. Driver: `run_policy_eval.py`;
-mechanism in `generation_functions.py` (`batch_sample_token_policy_flashattention`) + `model/modeling.py`
-(`forward_block_positions`, `kv_window`).
-
-> **One-line takeaway.** There are two orthogonal sparsity axes in the diffusion small step —
-> **compute** (query rows → token policy) and **memory** (KV bytes → streaming). **The token axis is a
-> free ~1.3×; the KV axis buys more speed (composes to ~1.8× at high batch) but at a real,
-> un-tunable accuracy cost on any task that needs content coverage.** Baseline is the *optimized*
-> Fast-dLLM v2 (a hard baseline), speedups are decode-throughput (tok/s) vs dense.
+**Meeting brief.** Study of two orthogonal sparsity axes in the Fast-dLLM v2 diffusion small step,
+extended to **batch size > 1**. Model: Fast-dLLM v2 7B (Qwen2.5-7B backbone, 32-token blocks).
+Hardware: RTX PRO 6000 (94 GB). Baseline: the *optimized* dense Fast-dLLM v2 (a hard baseline).
+Speedups = decode throughput (tok/s) vs dense; accuracy = LongBench token-F1 / GSM8K exact-match.
 
 ---
 
-## 1. Setup & definitions
+## TL;DR (the one slide)
 
-- **Small step** (diffusion denoising within a block) is ~94% of decode forwards and the only forward
-  either method speeds up. Prefill and commit steps are unpruned.
-- **Token policy (compute axis):** freeze a token's query once its final hidden state stops changing
-  across denoising steps (staleness < threshold) for `freeze_step` steps; recompute only the *active*
-  (non-frozen) positions via `forward_block_positions`. Frozen tokens keep cached KV so others still
-  attend to them. b>1 handled by **union of active positions** (a position is skipped only if frozen in
-  *all* sequences in the batch).
-- **KV streaming (memory axis):** during small steps, attention reads only the first `n_sink` + last
-  `n_recency` prefix **blocks** (a `kv_window` truncation gated to the mask-free small-step regime;
-  absolute rope preserved → retrieval-preserving StreamingLLM variant). Commit/prefill stay dense.
-- **Staleness metric:** `l2` (relative ‖Δh‖/‖h‖) ≫ `cosine`. l2 is near-lossless at high skip; cosine
-  over-locks (freezes tokens whose direction is stable but magnitude still shifts). All results use `l2`.
-- **Arms:** `dense` (ORG) · `token` (compute only) · `kv` (memory only = streaming with freeze=0) ·
-  `compose` (both). Speedup = arm tok/s ÷ dense tok/s. Accuracy: GSM8K exact-match; LongBench token-F1.
+Two levers speed up the diffusion small step, on **different hardware bottlenecks**:
 
----
-
-## 2. Token-level sparsity (compute axis) — **the free ~1.3×**
-
-The token policy is **accuracy-free across tasks and batches**, with speedup that grows with batch
-(the small step becomes compute-bound as batch amortizes the weight loads).
-
-| task (bs=64, gen=256, n=200) | dense F1 | token spd | token F1 | Δacc |
+| axis | what it cuts | speedup | accuracy | verdict |
 |---|---|---|---|---|
-| LongBench/hotpotqa | 0.244 | **1.29×** | 0.241 | −0.003 (free) |
-| LongBench/gov_report | 0.186 | **1.34×** | 0.182 | −0.004 (free) |
+| **Token policy** (compute) | query rows recomputed per step | **~1.3×** (grows to ~1.5× w/ batch) | **free** — ≈ dense on 4 tasks | **the win** |
+| **KV streaming** (memory) | prefix KV bytes read | +0.1–0.4× on top | **−0.01 to −0.06 F1**, un-tunable | speed-for-accuracy knob |
+| **Composed** | both | up to **~1.8×** @ high batch | inherits the KV cost | near-multiplicative, not free |
 
-**Threshold Pareto (GSM8K, bs=64, n=200):** `l2 thr=0.01` is the near-lossless knee (0.690 vs dense
-0.695) at ~1.21×; `thr=0.02` gives ~1.39× for ~4–5 pts. Gap noise floor ≈ ±0.04 at n=200.
-
-**Batch scaling (token only):** ~1.16× (bs16) → ~1.3× (bs128). skip% holds ~50% (batch-union is mild —
-sequences with a shared prefix freeze correlated positions).
-
-**Verdict:** this is the solid, defensible contribution — Xinze's token policy extended to b>1,
-near-lossless ~1.3× on a hard baseline.
+**Headline:** the **token policy is a free ~1.3× at b>1** (the deliverable). Composing streaming-KV
+stacks to ~1.8× at high batch but costs content coverage that **selection cannot recover** (content ≈
+position) — so it's a characterized tradeoff, not a free multiplier.
 
 ---
 
-## 3. KV-level sparsity (memory axis) — **more speed, but it costs coverage**
+## 1. What was built
 
-Streaming KV adds speed, especially at high batch, **but always costs accuracy where the task needs
-the middle of the context** — and the cost does **not** tune away with window size.
+The **small step** (diffusion denoising within a block) is ~94% of decode forwards and the only forward
+these methods touch (prefill + commit stay dense). Two independent sparsity axes:
 
-### 3a. Standalone KV cost (bs=64, gen=256)
-| task | dense F1 | kv spd | kv F1 | Δacc |
+- **Token policy (compute axis)** — Xinze's method, **newly extended to b>1**. A token freezes once its
+  hidden state stops changing across denoising steps (staleness `l2` < thr) and is not recomputed for
+  `freeze` steps; only *active* positions run through `forward_block_positions`. Frozen tokens keep
+  cached KV so others still attend. **Batching** via a *union of active positions* (skip a position only
+  if frozen in all sequences).
+- **KV streaming (memory axis)** — small steps read only the first `n_sink` + last `n_recency` prefix
+  **blocks** (a `kv_window` truncation; absolute rope preserved → retrieval-preserving StreamingLLM).
+- **Metric:** `l2` (relative ‖Δh‖/‖h‖) ≫ `cosine` — cosine over-locks (freezes tokens whose direction
+  is stable but magnitude still shifts). All results use `l2`.
+- **Arms:** `dense` · `token` (compute only) · `kv` (memory only) · `compose` (both).
+
+---
+
+## 2. Finding 1 — Token policy is a **free ~1.3×** (the result)
+
+**Accuracy is untouched across four LongBench tasks** (bs=64, gen=256, n=200):
+
+| task | dense F1 | token F1 | Δ |
+|---|---|---|---|
+| hotpotqa | 0.244 | 0.241 | −0.003 |
+| gov_report | 0.215 | 0.214 | −0.001 |
+| 2wikimqa | 0.145 | 0.144 | −0.001 |
+| multifieldqa_en | 0.408 | 0.410 | +0.002 |
+
+All within ±0.01 (F1 noise floor). **The compute axis costs no accuracy, on every task tested.**
+
+**Speed: ~1.2–1.4×, growing with batch** (small step becomes compute-bound as batch amortizes weight
+loads). Clean example (gov_report, monotonic): 1.17× (bs8) → 1.24× → 1.33× → **1.38× (bs64)**.
+Threshold Pareto (GSM8K): `l2 thr=0.01` is the near-lossless knee at ~1.2×; `thr=0.02` → ~1.4× for a
+few points. skip% holds ~50% (batch-union is mild — a shared prefix makes sequences freeze correlated
+positions).
+
+> *Measurement note:* early single-run timings were noisy/non-monotonic due to CUDA cold-start on the
+> first config; the harness now warms up and medians `--repeat` runs. Accuracy numbers were always clean.
+
+---
+
+## 3. Finding 2 — KV streaming buys speed but **costs content coverage**
+
+Streaming adds speed (more at high batch) but **loses accuracy on any task that needs the middle of the
+context**, and the loss does **not** tune away with window size.
+
+**Standalone KV cost** (bs=64, gen=256):
+| task | dense F1 | kv F1 | Δ |
+|---|---|---|---|
+| hotpotqa (multi-hop) | 0.228 | 0.215 | −0.013 |
+| gov_report (summarization) | 0.186 | 0.124 | **−0.062** |
+
+**Window Pareto — no near-lossless setting** (hotpotqa, bs=64, n=200):
+| n_recency | blocks kept (of 128) | F1 |
+|---|---|---|
+| dense | 128 | 0.244 |
+| 4 | 6 | 0.208 |
+| 8 | 10 | 0.210 |
+| 16 | 18 | 0.201 |
+| 32 | 34 | 0.220 |
+
+F1 stays ~0.20–0.22 regardless of window — it never climbs back to dense, even keeping 27% of context.
+
+**Why (the mechanism):** the cost is from **having a KV budget at all** (dropping most blocks), not from
+*how* you pick within it. Multi-hop evidence is diffuse; summaries need full coverage — no position
+window captures either. This reconfirms the prior project's core result: **content selection ≈ position**
+(commit-score top-K does not beat sink+recency). *You cannot select your way out of needing the context.*
+(Note: the prior "recency pinning helps gov_report" was about **coherence** — repetition/looping — not
+**coverage**. Streaming keeps output fluent, not complete.)
+
+---
+
+## 4. Finding 3 — Composition: the roofline crossover
+
+The axes are genuinely orthogonal (compute vs memory), so at high batch — FFN compute-bound **and** KV
+read memory-bound — they compound **nearly multiplicatively** (hotpotqa, gen=256):
+
+| bs | token | kv | compose | token×kv (if mult.) |
 |---|---|---|---|---|
-| hotpotqa (n=100) | 0.228 | 1.22× | 0.215 | −0.013 |
-| gov_report (n=100) | 0.186 | 1.15× | 0.124 | **−0.062** |
+| 16 | 1.16× | 1.18× | 1.23× | 1.37× |
+| 64 | 1.26× | 1.22× | 1.40× | 1.54× |
+| 128 | 1.31× | 1.45× | **1.81×** | 1.90× |
 
-### 3b. Window Pareto — no near-lossless setting (hotpotqa, bs=64, n=200, compose)
-| n_recency | blocks kept (of 128) | compose spd | compose F1 |
-|---|---|---|---|
-| dense | 128 | 1.00× | 0.244 |
-| 4 | 6 | 1.42× | 0.208 |
-| 8 | 10 | 1.27× | 0.210 |
-| 16 | 18 | 1.31× | 0.201 |
-| 32 | 34 | 1.39× | 0.220 |
-
-**F1 stays ~0.20–0.22 regardless of window — it never climbs back to dense (0.244), even keeping 27% of
-the context.** (Speeds are single-run noisy; F1 flatness is the signal.)
-
-**Why:** the accuracy cost is from **having a KV budget at all** (dropping most blocks), not from *how*
-you pick within it. hotpotqa is multi-hop (evidence diffuse) and gov_report is summarization (needs
-full coverage) — in both, no position window captures what's needed. This reconfirms the prior
-project's core result: **content selection ≈ position** (commit-score top-K does not beat sink+recency;
-the "marginal multi-hop edge" was noise). You cannot *select* your way out of needing the full context.
-
-> **Important distinction:** the prior "recency pinning helps gov_report" result was about **coherence**
-> (repetition/looping), not **content coverage**. Streaming keeps output *fluent* but not *complete* —
-> which is why summarization F1/ROUGE still drops.
+- Composition gain grows with batch: +0.05× → +0.14× → **+0.36×**; at bs=128, composed (1.81×) ≈ the
+  product (1.90×).
+- **Bonus:** dense throughput *drops* at bs=128 (KV cache hits the memory wall) while sparse arms keep
+  scaling → **KV sparsity extends the servable batch range** past where dense thrashes.
+- **Clean cost split:** token F1 ≈ dense at every batch (compute free); *all* accuracy cost is the KV
+  axis; compose inherits only the KV cost.
 
 ---
 
-## 4. Composition — the roofline crossover
+## 5. Honest bottom line & recommendation
 
-The two axes are genuinely orthogonal (compute vs memory), so at high batch — where the FFN is
-compute-bound **and** the KV read is memory-bound — they compound **nearly multiplicatively**.
+**Stable conclusion (invariant across every run): token axis = free; KV axis = coverage-costly and
+un-selectable.**
 
-| bs (hotpotqa, gen=256) | token | kv | compose | token×kv (if mult.) | compose F1 vs dense |
-|---|---|---|---|---|---|
-| 16 | 1.16× | 1.18× | 1.23× | 1.37× | 0.203 vs 0.227 |
-| 64 | 1.26× | 1.22× | 1.40× | 1.54× | 0.214 vs 0.228 |
-| 128 | 1.31× | 1.45× | **1.81×** | 1.90× | 0.198 vs 0.244 |
-
-- **Composition gain grows with batch:** +0.05× (bs16) → +0.14× (bs64) → **+0.36× (bs128)**;
-  at bs=128 composed (1.81×) ≈ the product (1.90×).
-- **Bonus serving effect:** dense tok/s *drops* at bs=128 (KV cache hits the memory wall) while sparse
-  arms keep scaling → **KV sparsity extends the batch-scaling range** past where dense OOMs/thrashes.
-- **Clean cost decomposition:** token F1 ≈ dense at every batch (compute axis free); **all** the accuracy
-  cost is the KV axis; compose inherits only the KV cost.
+- **Present the token policy as the contribution:** Xinze's method extended to b>1, **free ~1.3×**
+  (→ ~1.5× at high batch) on a hard baseline, validated accuracy-neutral on 4 tasks. Clean and defensible.
+- **Present KV composition as a characterized extension**, not a headline: it stacks on throughput (up to
+  ~1.8×) and extends batch-scaling, but the memory axis costs content coverage that selection can't
+  recover — which independently reconfirms the prior content ≈ position finding.
+- **Open decision for the meeting:** is the higher-batch composition regime (≥1.8×, needs chunked prefill
+  to push past bs~100 at 4k) worth pursuing, or is the free token-policy 1.3× the paper?
 
 ---
 
-## 5. Honest bottom line
+## 6. Limitations & caveats (state these explicitly)
 
-| axis | speedup | accuracy | verdict |
-|---|---|---|---|
-| **Token (compute)** | ~1.3× (grows to ~1.5× w/ batch) | **free** (≈ dense everywhere) | **the win — universal, defensible** |
-| **KV (memory)** | +0.1–0.4× on top (batch-dependent) | **−0.01 to −0.06 F1**, un-tunable, task-dependent | speed-for-accuracy knob, not free |
-| **Composed** | up to **~1.8×** @ bs≥128 | inherits the KV cost | near-multiplicative, but not free |
-
-**Framing:** lead with the token policy (free ~1.3×, b>1 extension). Present KV composition as a
-*characterized* extension: it stacks on throughput and extends batch-scaling, but the memory axis costs
-content coverage that selection cannot recover (content ≈ position). This turns the KV result into a
-clean characterization consistent with the prior project, rather than an oversold multiplier.
-
----
-
-## 6. Caveats & limitations
-
-- **Speedup scope:** decode-throughput (tok/s) vs *optimized* dense Fast-dLLM v2, gen=256, 4k context.
-  Report the operating point explicitly; the ~1.3–1.8× depends on gen length (short gen → prefill
-  dominates → lower) and batch.
-- **Generation length matters:** at gen=128 the KV benefit shrinks to ~1.1–1.2× (prefill dilution);
-  the ~1.3–1.4× KV numbers require gen≥256. (Confirms the prior gen-length sweep: 64→1.09×, 256→1.31×.)
-- **Memory ceiling:** bs>~100 at 4k OOMs on the **dense prefill FFN activation** (~18.5 GB for
-  `[128,4096,18944]`), not the KV cache. Higher batch needs **chunked prefill** (unimplemented).
-- **Metric:** gov_report is officially ROUGE-L; the driver uses token-F1 as a rough proxy — trust the
-  *relative* drop, not the absolute value.
-- **Noise:** F1 noise ~±0.02–0.03 at n=100–200; single-batch speed points are timing-noisy (e.g. a
-  bs=32 row showed compose < both single axes, which is physically impossible = noise).
-- **skip% is an unreliable cross-arm proxy** (denominator is block_size=32 but subblock steps touch ≤8
-  positions → a ~55% structural baseline swamps the freeze signal). Trust speed + F1.
+- **Scope:** decode throughput vs *optimized* dense v2, gen=256, 4k ctx. The ~1.3–1.8× depends on gen
+  length (short gen → prefill dominates → lower; gen=128 gave ~1.1–1.2×) and batch. Report the operating
+  point.
+- **Memory ceiling:** bs>~100 at 4k OOMs on the **dense prefill FFN activation** (~18.5 GB), not the KV
+  cache. Higher batch needs **chunked prefill** (unimplemented).
+- **Metric:** gov_report is officially ROUGE-L; driver uses token-F1 as a proxy — trust the *relative*
+  drop, not the absolute.
+- **Noise:** F1 ~±0.02–0.03 at n=200; single-run speed is timing-noisy (use `--repeat`, warmup is
+  automatic). One bs=32 row once showed compose < both single axes — physically impossible = noise.
+- **skip% is an unreliable cross-arm proxy** (block_size denominator vs ≤8-position subblock steps) —
+  trust speed + F1.
+- **MAGE-style content arming not re-tested here**; standalone content-vs-position is settled in the
+  prior project (`baseline_compare.py`).
 
 ---
 
 ## 7. Reproduce
 
 ```bash
-# Headline token-only table (free ~1.3x) across tasks x batches:
-python run_policy_eval.py --task longbench --lb_tasks hotpotqa,gov_report,2wikimqa,multifieldqa_en \
-  --ctx 4096 --n 200 --gen 256 --uniform --metric l2 --thr 0.01 --kv_mode none \
-  --batch_sizes 8,16,32,64
+# Headline: token-only free ~1.3x across tasks x batches (accuracy-neutral)
+python run_policy_eval.py --task longbench \
+  --lb_tasks hotpotqa,gov_report,2wikimqa,multifieldqa_en \
+  --ctx 4096 --n 200 --gen 256 --uniform --metric l2 --thr 0.01 \
+  --kv_mode none --batch_sizes 8,16,32,64 --repeat 3
 
-# Full 4-way decomposition (dense / kv / token / compose) at one batch:
+# 4-way decomposition (dense / kv / token / compose) at one batch
 python run_policy_eval.py --task longbench --lb_task hotpotqa --ctx 4096 --n 200 --gen 256 \
-  --uniform --metric l2 --thr 0.01 --kv_mode fourway --n_sink 2 --n_recency 8 --batch_sizes 64
+  --uniform --metric l2 --thr 0.01 --kv_mode fourway --n_sink 2 --n_recency 8 --batch_sizes 64 --repeat 3
 
-# KV window Pareto:
+# KV window Pareto
 for rec in 4 8 16 32; do
   python run_policy_eval.py --task longbench --lb_task hotpotqa --ctx 4096 --n 200 --gen 256 \
-    --uniform --metric l2 --thr 0.01 --kv_mode compose --n_sink 2 --n_recency $rec --batch_sizes 64
+    --uniform --metric l2 --thr 0.01 --kv_mode compose --n_sink 2 --n_recency $rec --batch_sizes 64 --repeat 3
 done
 ```
+
+Code: `run_policy_eval.py` (driver) · `generation_functions.py` (`batch_sample_token_policy_flashattention`,
+b>1 union, `kv_window`) · `model/modeling.py` (`forward_block_positions`, `kv_window` read-truncation).
