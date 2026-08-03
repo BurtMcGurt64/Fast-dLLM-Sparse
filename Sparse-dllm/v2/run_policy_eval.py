@@ -74,9 +74,9 @@ def run(model, tok, sampler, batches, device, gen, **pk):
         out = sampler(input_ids=ids, tokenizer=tok, block_size=32, max_new_tokens=gen,
                       small_block_size=8, min_len=min_len, seq_len=seq_len,
                       threshold=0.95, temperature=0.0, use_block_cache=True, **pk)
-        seq = out[0] if isinstance(out, tuple) else out
-        for b in range(seq.shape[0]):
-            g_ids = seq[b, ids.shape[1]:]
+        # samplers return finished_samples: dict {batch_idx: full_sequence_1d}
+        for b in range(len(golds)):
+            g_ids = out[b][ids.shape[1]:]                 # generated part (after left-padded prompt)
             ntok += int((g_ids != tok.pad_token_id).sum()) if tok.pad_token_id is not None else g_ids.numel()
             p = pred(tok.decode(g_ids, skip_special_tokens=True))
             correct += int(p is not None and p == golds[b]); total += 1
