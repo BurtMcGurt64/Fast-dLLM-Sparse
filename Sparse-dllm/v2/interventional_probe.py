@@ -65,12 +65,15 @@ def _kl(p_logits, q_logits):
 
 
 @torch.no_grad()
-def block_forward(model, block_ids, pkv, skip=None):
-    """One block small-step forward. skip=(layer, module) residual-skips that module for the given
-    token positions set on the layer beforehand. Returns logits[1,T,V], hidden[1,T,D]."""
+def block_forward(model, block_ids, pkv):
+    """One block small-step forward. Returns logits[1,T,V], hidden[1,T,D].
+    Note: out.hidden_states is the FINAL hidden state tensor [1,T,D] (not a per-layer tuple)."""
     out = model.forward(input_ids=block_ids, use_cache=True, past_key_values=pkv,
                         update_past_key_values=False, use_block_cache=True, output_hidden_states=True)
-    return out.logits, out.hidden_states[-1]
+    h = out.hidden_states
+    if h.dim() == 2:
+        h = h.unsqueeze(0)
+    return out.logits, h
 
 
 @torch.no_grad()
@@ -97,6 +100,7 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     settled = (late[0] != MASK_ID).cpu().numpy().astype(float)          # baseline: is-settled flag
     hnorm = h_l[0].float().norm(dim=-1).cpu().numpy()                   # baseline: raw ||hidden||
     ref = logits_l                                                      # [1,T,V]
+    ref_arg = ref.argmax(-1)[0]                                         # [T] reference decoded ids
 
     rows = []
     for l in layers:
@@ -106,9 +110,13 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
                 skip_logits, _ = block_forward(model, late, pkv)
                 setattr(model.model.layers[l], f"_skip_{mod}_pos", None)
                 kl_all = _kl(ref, skip_logits)[0]                       # [T]
-                local = kl_all[t].item()
-                cross = (kl_all.sum().item() - local) / (BLOCK - 1)
-                rows.append(dict(layer=l, mod=mod, tok=t, local=local, cross=cross,
+                flip = (skip_logits.argmax(-1)[0] != ref_arg)          # [T] bool: did the argmax flip
+                local_flip = int(flip[t].item())                       # ABSOLUTE, comparable label
+                cross_flip = (int(flip.sum().item()) - local_flip) / (BLOCK - 1)  # leakage into others
+                rows.append(dict(layer=l, mod=mod, tok=t,
+                                 local_flip=local_flip, cross_flip=cross_flip,
+                                 local_kl=kl_all[t].item(),
+                                 cross_kl=(kl_all.sum().item() - kl_all[t].item()) / (BLOCK - 1),
                                  stale_l2=float(stale_l2[t]), stale_kl=float(stale_kl[t]),
                                  settled=float(settled[t]), hnorm=float(hnorm[t])))
     return rows
@@ -165,8 +173,9 @@ def main():
         if s + win > stream.shape[0]:
             break
         r = probe_one(model, stream[s:s + win], args.prompt_blocks, args.device, layers, seed=args.seed + k)
-        if r:
-            rows.extend(r)
+        for row in (r or []):
+            row["ex"] = k
+            rows.append(row)
         print(f"  example {k+1}/{args.n} done ({len(rows)} intervention points)", flush=True)
 
     if not rows:
@@ -174,34 +183,72 @@ def main():
     depth_of = lambda l: "early" if l < L / 3 else ("mid" if l < 2 * L / 3 else "late")
     preds = ["hnorm", "settled", "stale_l2", "stale_kl"]
 
-    print(f"\nInterventional skippability — {len(rows)} points ({args.n} examples), skippable = local damage "
-          f"below {args.eps_pct:.0f}th pct")
-    print("  Baseline ladder AUC (higher = predictor better separates skippable). settled/hnorm are the")
-    print("  trivial baselines; staleness must BEAT them or the diffusion signal adds nothing.\n")
-    print(f"  {'module':>5} {'depth':>5} {'n':>5} {'skip%':>6}  " + "  ".join(f"{p:>9}" for p in preds)
-          + f"  {'ρ(l2,local)':>11} {'ρ(l2,cross)':>11}")
-    print("  " + "-" * 100)
+    def disc_auc(grp, pred):
+        """Discrimination AUC (direction-agnostic): how well `pred` separates skippable (argmax
+        preserved) from not. max(auc, 1-auc) since predictors have different natural signs."""
+        label = np.array([1 - r["local_flip"] for r in grp])          # 1 = argmax preserved = skippable
+        a = auc([r[pred] for r in grp], label)
+        return max(a, 1 - a) if a == a else float("nan")
+
+    def boot_ci(grp, pred, nboot=300):
+        """Bootstrap disc-AUC over EXAMPLES (not rows) — points within a block are correlated."""
+        by_ex = {}
+        for r in grp: by_ex.setdefault(r["ex"], []).append(r)
+        exs = list(by_ex); rng = np.random.default_rng(0)
+        vals = []
+        for _ in range(nboot):
+            samp = [x for e in rng.choice(exs, len(exs)) for x in by_ex[e]]
+            v = disc_auc(samp, pred)
+            if v == v: vals.append(v)
+        if not vals: return float("nan"), float("nan")
+        return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+    # --- Table 1: baseline-ladder discrimination AUC + comparable skip% (absolute argmax-flip label) ---
+    print(f"\nInterventional skippability — {len(rows)} points, {args.n} examples.")
+    print("  skip% = fraction where the token's decoded argmax is UNCHANGED after residual-skipping the module")
+    print("  (absolute, comparable across rows). AUC = how well each predictor separates skippable; staleness")
+    print("  must BEAT settled/hnorm (the trivial baselines) or the diffusion signal adds nothing over SkipGPT.\n")
+    print(f"  {'module':>5} {'depth':>5} {'n':>5} {'skip%':>6} {'xflip%':>6}  " + "  ".join(f"{p:>8}" for p in preds)
+          + f"  {'ρ(l2,dmg)':>9}")
+    print("  " + "-" * 92)
     for mod in ("attn", "ffn"):
         for d in ("early", "mid", "late"):
             grp = [r for r in rows if r["mod"] == mod and depth_of(r["layer"]) == d]
-            if not grp:
-                continue
-            local = np.array([r["local"] for r in grp])
-            cross = np.array([r["cross"] for r in grp])
-            eps = np.percentile(local, args.eps_pct)
-            label = (local <= eps).astype(int)                 # 1 = low damage = skippable
-            aucs = [auc([r[p] for r in grp], label) for p in preds]  # low predictor -> skippable
-            sp_l = spearman([r["stale_l2"] for r in grp], local)
-            sp_c = spearman([r["stale_l2"] for r in grp], cross)
-            print(f"  {mod:>5} {d:>5} {len(grp):>5} {label.mean():>5.0%}  "
-                  + "  ".join(f"{a:>9.3f}" for a in aucs) + f"  {sp_l:>11.2f} {sp_c:>11.2f}")
+            if not grp: continue
+            skip_pct = np.mean([1 - r["local_flip"] for r in grp])
+            xflip = np.mean([r["cross_flip"] for r in grp])            # leakage into other tokens
+            aucs = [disc_auc(grp, p) for p in preds]
+            sp = spearman([r["stale_l2"] for r in grp], [r["local_kl"] for r in grp])
+            print(f"  {mod:>5} {d:>5} {len(grp):>5} {skip_pct:>5.0%} {xflip:>5.1%}  "
+                  + "  ".join(f"{a:>8.3f}" for a in aucs) + f"  {sp:>9.2f}")
 
-    print("\n  READ:")
-    print("  - stale_l2/stale_kl AUC > settled/hnorm AUC  => staleness carries signal beyond trivial => router justified.")
-    print("  - stale AUC ~= settled AUC                    => a settle-counter suffices; no hidden-state router needed.")
-    print("  - attn vs ffn skip% / AUC gap                => which module to route harder (Xinze's decoupling).")
-    print("  - ρ(l2,cross) strongly negative               => converged tokens leak little into others => globally safe.")
-    print("  NOTE: L1 proxy (2-step staleness, one-step damage). If signal is real, confirm with full-trajectory oracle (L2).")
+    # --- Table 2: the confound check — is the depth trend convergence-driven or "less room to propagate"? ---
+    print("\n  Confound check — skip% for CONVERGED (settled) vs UNCONVERGED (masked) tokens, by depth.")
+    print("  If converged >> unconverged at all depths -> convergence effect (good). If both rise together at")
+    print("  late layers -> it's just 'late skips have less room to propagate', NOT your hypothesis.\n")
+    print(f"  {'module':>5} {'depth':>5} {'conv skip%':>11} {'unconv skip%':>13} {'gap':>7}")
+    print("  " + "-" * 50)
+    for mod in ("attn", "ffn"):
+        for d in ("early", "mid", "late"):
+            grp = [r for r in rows if r["mod"] == mod and depth_of(r["layer"]) == d]
+            c = [1 - r["local_flip"] for r in grp if r["settled"] > 0.5]
+            u = [1 - r["local_flip"] for r in grp if r["settled"] <= 0.5]
+            if not c or not u: continue
+            print(f"  {mod:>5} {d:>5} {np.mean(c):>10.0%} {np.mean(u):>12.0%} {np.mean(c)-np.mean(u):>+7.0%}")
+
+    # --- Table 3: headline — does staleness beat the trivial baselines? (bootstrap CI over examples) ---
+    print("\n  HEADLINE — pooled discrimination AUC with 95% bootstrap CI over EXAMPLES (the honest n).")
+    print("  stale_* CI clearing settled/hnorm CI = staleness carries real signal beyond trivial -> router justified.\n")
+    for mod in ("attn", "ffn"):
+        grp = [r for r in rows if r["mod"] == mod]
+        print(f"    [{mod}]")
+        for p in preds:
+            lo, hi = boot_ci(grp, p)
+            print(f"      {p:>9}: AUC {disc_auc(grp, p):.3f}  95%CI [{lo:.3f}, {hi:.3f}]")
+
+    print("\n  NOTE: L1 proxy — staleness is a 2-mask-level delta (not real consecutive-step ‖Δh‖), and damage")
+    print("  is logit-argmax-flip vs a 25%-masked reference (not a full re-decode to ground truth). If the")
+    print("  ladder shows staleness winning, confirm with real-trajectory staleness + full-decode oracle (L2).")
 
 
 if __name__ == "__main__":
