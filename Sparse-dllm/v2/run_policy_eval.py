@@ -168,6 +168,8 @@ def main():
                    help="gsm8k=short ctx (memory axis tiny, expect streaming~=no-op); "
                         "longbench=long ctx (memory axis real -> crossover can appear)")
     p.add_argument("--lb_task", default="hotpotqa", help="LongBench subset (hotpotqa/2wikimqa/narrativeqa/...)")
+    p.add_argument("--lb_tasks", default="", help="comma-sep LongBench subsets; loops over each (overrides --lb_task). "
+                                                 "Use with --kv_mode none for the headline token-only x task x batch table")
     p.add_argument("--ctx", type=int, default=4096, help="longbench: truncate each prompt to this many tokens")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
@@ -189,18 +191,6 @@ def main():
     model = model.to(args.device).eval()
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    if args.task == "gsm8k":
-        from datasets import load_dataset
-        ds = load_dataset("gsm8k", "main", split="test").shuffle(seed=args.seed).select(range(args.n))
-        data = [(tok(GSM8K_FEWSHOT + f"Question: {ex['question']}\nAnswer:", return_tensors="pt").input_ids[0],
-                 gold(ex["answer"])) for ex in ds]
-        score_fn = gsm8k_score
-        task_desc = f"GSM8K n={args.n}"
-    else:
-        data = load_longbench(args.lb_task, args.n, args.ctx, tok, args.seed)
-        score_fn = qa_f1
-        task_desc = f"LongBench/{args.lb_task} ctx<={args.ctx} n={args.n} (metric=token-F1)"
-
     org = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample, model)
     tokp = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample_token_policy_flashattention, model)
     GF.set_staleness_metric(args.metric)
@@ -218,32 +208,47 @@ def main():
                    ("kv", dict(stream_kw, token_policy_freeze_step=0)),
                    ("compose", dict(stream_kw))]
 
+    def build_task(spec):
+        if spec == "gsm8k":
+            from datasets import load_dataset
+            ds = load_dataset("gsm8k", "main", split="test").shuffle(seed=args.seed).select(range(args.n))
+            data = [(tok(GSM8K_FEWSHOT + f"Question: {ex['question']}\nAnswer:", return_tensors="pt").input_ids[0],
+                     gold(ex["answer"])) for ex in ds]
+            return data, gsm8k_score, f"GSM8K n={args.n}"
+        data = load_longbench(spec, args.n, args.ctx, tok, args.seed)
+        return data, qa_f1, f"LongBench/{spec} ctx<={args.ctx} n={args.n} (metric=token-F1)"
+
+    # Task list: --lb_tasks (comma-sep longbench) loops; else single --task/--lb_task.
+    if args.lb_tasks:
+        task_specs = [t.strip() for t in args.lb_tasks.split(",") if t.strip()]
+    else:
+        task_specs = ["gsm8k"] if args.task == "gsm8k" else [args.lb_task]
+
     win = f", KV sink={args.n_sink}+rec={args.n_recency} blk" if args.kv_mode != "none" else ""
-    print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}{win}), {task_desc}")
-    print("  compute axis = token policy (query rows); memory axis = streaming KV (prefix bytes).")
-    hdr = f"  {'bs':>3} {'ORG t/s':>8} {'ORGacc':>6}"
-    for name, _ in kv_arms:
-        hdr += f" | {name:>7} t/s  spd  skip%  acc"
-    print(hdr)
-    ulen = 0
-    if args.uniform:
-        ulen = max(e.shape[0] for e, _ in data)
-        print(f"  (uniform batching: all prompts padded to {ulen} tokens)")
-    for bs in [int(x) for x in args.batch_sizes.split(",")]:
-        batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
-        org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen, score_fn)
-        row = f"  {bs:>3} {org_tps:>8.1f} {org_acc:>6.3f}"
-        for name, kvkw in kv_arms:
-            extra = dict(token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
-            if kvkw:
-                extra.update(kvkw)
-            acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen, score_fn, **extra)
-            spd = tps / org_tps if org_tps else 0.0
-            row += f" | {tps:>9.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
-        print(row, flush=True)
-    print("\n  Crossover read: 'stream' should help most at LOW batch (memory-bound: KV bytes dominate),")
-    print("  'none' (token policy) at HIGH batch (compute-bound: query rows dominate). If 'stream' never")
-    print("  beats 'none', the two are pure substitutes here and composition adds nothing at this shape.")
+    for spec in task_specs:
+        data, score_fn, task_desc = build_task(spec)
+        print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}{win}), {task_desc}")
+        print("  compute axis = token policy (query rows); memory axis = streaming KV (prefix bytes).")
+        hdr = f"  {'bs':>3} {'ORG t/s':>8} {'ORGacc':>6}"
+        for name, _ in kv_arms:
+            hdr += f" | {name:>7} t/s  spd  skip%  acc"
+        print(hdr)
+        ulen = 0
+        if args.uniform:
+            ulen = max(e.shape[0] for e, _ in data)
+            print(f"  (uniform batching: all prompts padded to {ulen} tokens)")
+        for bs in [int(x) for x in args.batch_sizes.split(",")]:
+            batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
+            org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen, score_fn)
+            row = f"  {bs:>3} {org_tps:>8.1f} {org_acc:>6.3f}"
+            for name, kvkw in kv_arms:
+                extra = dict(token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
+                if kvkw:
+                    extra.update(kvkw)
+                acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen, score_fn, **extra)
+                spd = tps / org_tps if org_tps else 0.0
+                row += f" | {tps:>9.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
+            print(row, flush=True)
 
 
 if __name__ == "__main__":
