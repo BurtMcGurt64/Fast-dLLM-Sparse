@@ -157,9 +157,11 @@ def main():
     p.add_argument("--batch_sizes", default="1,4,8,16")
     p.add_argument("--metric", default="l2", choices=["cosine", "l2"])
     p.add_argument("--thr", type=float, default=0.02, help="freeze threshold (l2~0.02, cosine~0.99)")
-    p.add_argument("--kv_mode", default="none", choices=["none", "streaming", "compose"],
+    p.add_argument("--kv_mode", default="none", choices=["none", "streaming", "compose", "fourway"],
                    help="none=token policy only; streaming=token+KV window; "
-                        "compose=run BOTH (token-only and token+KV) per batch to show the roofline crossover")
+                        "compose=token-only vs token+KV per batch; "
+                        "fourway=token-only vs KV-only vs composed (KV-only = streaming with freeze=0 "
+                        "so nothing freezes -> dense queries + windowed KV, reproduces standalone KV top-K)")
     p.add_argument("--n_sink", type=int, default=2, help="streaming: prefix BLOCKS kept at the front")
     p.add_argument("--n_recency", type=int, default=4, help="streaming: prefix BLOCKS kept at the end")
     p.add_argument("--task", default="gsm8k", choices=["gsm8k", "longbench"],
@@ -203,20 +205,25 @@ def main():
     tokp = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample_token_policy_flashattention, model)
     GF.set_staleness_metric(args.metric)
 
-    # Which token-policy arms to run per batch. compose = both, to expose the roofline crossover.
+    # Which token-policy arms to run per batch. compose/fourway expose the roofline crossover.
+    stream_kw = dict(kv_mode="streaming", n_sink=args.n_sink, n_recency=args.n_recency)
     kv_arms = [("none", None)]
     if args.kv_mode == "streaming":
-        kv_arms = [("stream", dict(kv_mode="streaming", n_sink=args.n_sink, n_recency=args.n_recency))]
+        kv_arms = [("stream", dict(stream_kw))]
     elif args.kv_mode == "compose":
-        kv_arms = [("none", None),
-                   ("stream", dict(kv_mode="streaming", n_sink=args.n_sink, n_recency=args.n_recency))]
+        kv_arms = [("token", None), ("compose", dict(stream_kw))]
+    elif args.kv_mode == "fourway":
+        # KV-only = streaming with freeze=0 (nothing stays frozen -> dense queries + windowed KV).
+        kv_arms = [("token", None),
+                   ("kv", dict(stream_kw, token_policy_freeze_step=0)),
+                   ("compose", dict(stream_kw))]
 
     win = f", KV sink={args.n_sink}+rec={args.n_recency} blk" if args.kv_mode != "none" else ""
     print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}{win}), {task_desc}")
     print("  compute axis = token policy (query rows); memory axis = streaming KV (prefix bytes).")
-    hdr = f"  {'bs':>3} {'ORG t/s':>8}"
+    hdr = f"  {'bs':>3} {'ORG t/s':>8} {'ORGacc':>6}"
     for name, _ in kv_arms:
-        hdr += f" | {name:>6} t/s  spd  skip%  acc"
+        hdr += f" | {name:>7} t/s  spd  skip%  acc"
     print(hdr)
     ulen = 0
     if args.uniform:
@@ -225,14 +232,14 @@ def main():
     for bs in [int(x) for x in args.batch_sizes.split(",")]:
         batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
         org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen, score_fn)
-        row = f"  {bs:>3} {org_tps:>8.1f}"
+        row = f"  {bs:>3} {org_tps:>8.1f} {org_acc:>6.3f}"
         for name, kvkw in kv_arms:
             extra = dict(token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
             if kvkw:
                 extra.update(kvkw)
             acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen, score_fn, **extra)
             spd = tps / org_tps if org_tps else 0.0
-            row += f" | {tps:>8.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
+            row += f" | {tps:>9.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
         print(row, flush=True)
     print("\n  Crossover read: 'stream' should help most at LOW batch (memory-bound: KV bytes dominate),")
     print("  'none' (token policy) at HIGH batch (compute-bound: query rows dominate). If 'stream' never")
