@@ -53,6 +53,63 @@ def gsm8k_score(text, g):
     p = pred(text); return float(p is not None and p == g)
 
 
+# ---- MATH (competition_math via MATH-500; parquet, pre-extracted `answer`) --------------------
+MATH_FEWSHOT = """Problem: What is $1+2+3+\\cdots+10$?
+Solution: The sum is $\\frac{10\\cdot 11}{2}=55$. The final answer is $\\boxed{55}$.
+
+Problem: If $2x+3=11$, what is $x$?
+Solution: Subtract 3: $2x=8$, so $x=4$. The final answer is $\\boxed{4}$.
+
+Problem: What is the value of $\\frac{1}{2}+\\frac{1}{3}$?
+Solution: Common denominator 6: $\\frac{3}{6}+\\frac{2}{6}=\\frac{5}{6}$. The final answer is $\\boxed{\\frac{5}{6}}$.
+
+"""
+
+def _last_boxed(s):
+    """Extract the content of the last \\boxed{...} with balanced braces."""
+    idx = s.rfind("\\boxed")
+    if idx < 0:
+        return None
+    i = s.find("{", idx)
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == "{": depth += 1
+        elif s[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j]
+    return None
+
+def _norm_math(a):
+    if a is None: return None
+    a = a.strip()
+    for tok in ["\\left", "\\right", "\\!", "\\,", "\\ ", " ", "$", "\\text{", "}", "\\dfrac", "\\tfrac"]:
+        a = a.replace(tok, "" if tok not in ("\\dfrac", "\\tfrac") else "\\frac")
+    return a.rstrip(".").strip()
+
+def math_score(text, gold_ans):
+    """Approximate MATH scoring: normalized string match of the last \\boxed{} to the gold answer.
+    NOTE: not full symbolic equivalence — treats e.g. 1/2 vs \\frac12 loosely; report as approximate."""
+    pred_box = _last_boxed(text)
+    if pred_box is None:                                   # fallback: last number-ish token
+        m = re.findall(r"-?[\d./]+", text)
+        pred_box = m[-1] if m else None
+    return float(pred_box is not None and _norm_math(pred_box) == _norm_math(str(gold_ans)))
+
+
+def load_math(n, tok, seed):
+    """MATH-500 (parquet, has pre-extracted `answer`). Returns (enc_1d, gold_answer)."""
+    from datasets import load_dataset
+    ds = load_dataset("HuggingFaceH4/MATH-500", split="test").shuffle(seed=seed).select(range(min(n, 500)))
+    out = []
+    for ex in ds:
+        prompt = MATH_FEWSHOT + f"Problem: {ex['problem']}\nSolution:"
+        out.append((tok(prompt, return_tensors="pt").input_ids[0], ex["answer"]))
+    return out
+
+
 # ---- LongBench (long-context) ----------------------------------------------------------------
 # Standard token-F1 (from the LongBench repo) for QA-style tasks.
 def _normalize(s):
@@ -164,9 +221,9 @@ def main():
                         "so nothing freezes -> dense queries + windowed KV, reproduces standalone KV top-K)")
     p.add_argument("--n_sink", type=int, default=2, help="streaming: prefix BLOCKS kept at the front")
     p.add_argument("--n_recency", type=int, default=4, help="streaming: prefix BLOCKS kept at the end")
-    p.add_argument("--task", default="gsm8k", choices=["gsm8k", "longbench"],
-                   help="gsm8k=short ctx (memory axis tiny, expect streaming~=no-op); "
-                        "longbench=long ctx (memory axis real -> crossover can appear)")
+    p.add_argument("--task", default="gsm8k", choices=["gsm8k", "math", "longbench"],
+                   help="gsm8k/math=short-ctx reasoning (the papers' serving regime; token-policy story, "
+                        "use thr=0.01); longbench=long ctx (memory axis real -> KV crossover can appear)")
     p.add_argument("--lb_task", default="hotpotqa", help="LongBench subset (hotpotqa/2wikimqa/narrativeqa/...)")
     p.add_argument("--lb_tasks", default="", help="comma-sep LongBench subsets; loops over each (overrides --lb_task). "
                                                  "Use with --kv_mode none for the headline token-only x task x batch table")
@@ -216,7 +273,9 @@ def main():
             ds = load_dataset("gsm8k", "main", split="test").shuffle(seed=args.seed).select(range(args.n))
             data = [(tok(GSM8K_FEWSHOT + f"Question: {ex['question']}\nAnswer:", return_tensors="pt").input_ids[0],
                      gold(ex["answer"])) for ex in ds]
-            return data, gsm8k_score, f"GSM8K n={args.n}"
+            return data, gsm8k_score, f"GSM8K n={args.n} (exact-match)"
+        if spec == "math":
+            return load_math(args.n, tok, args.seed), math_score, f"MATH-500 n={args.n} (approx boxed-match)"
         data = load_longbench(spec, args.n, args.ctx, tok, args.seed)
         return data, qa_f1, f"LongBench/{spec} ctx<={args.ctx} n={args.n} (metric=token-F1)"
 
@@ -227,11 +286,13 @@ def main():
                for _ in range(max(1, args.repeat))]
         return res[0][0], statistics.median(r[1] for r in res), res[0][2]
 
-    # Task list: --lb_tasks (comma-sep longbench) loops; else single --task/--lb_task.
+    # Task list: --lb_tasks (comma-sep; may mix gsm8k/math/longbench-subsets) loops; else single --task.
     if args.lb_tasks:
         task_specs = [t.strip() for t in args.lb_tasks.split(",") if t.strip()]
+    elif args.task in ("gsm8k", "math"):
+        task_specs = [args.task]
     else:
-        task_specs = ["gsm8k"] if args.task == "gsm8k" else [args.lb_task]
+        task_specs = [args.lb_task]
 
     # Warmup: one untimed short generation to trigger CUDA/cuDNN autotuning so the first TIMED config
     # isn't cold (a cold first config slows ORG -> inflates its speedup ratio and looks non-monotonic).
