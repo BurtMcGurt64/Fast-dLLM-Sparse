@@ -722,11 +722,21 @@ class Fast_dLLM_QwenForCausalLM:
         token_policy_threshold=0.99,
         token_policy_freeze_step=3,
         estimate_flops=False,
+        kv_mode="none",
+        n_sink=2,
+        n_recency=4,
     ):
         """
         Token-policy decoding with a single sparse forward per step on active tokens.
         This uses Q for active tokens and full K/V from the block cache (FlashAttention via SDPA).
+
+        kv_mode: "none" (dense prefix read) or "streaming" (compose with KV sparsity — small-step
+        forwards read only the first n_sink + last n_recency prefix BLOCKS). This attacks the memory
+        axis (KV bytes read) while the token policy attacks the compute axis (query rows): the two
+        roofline regimes. Commit/prefill forwards always read the full prefix (dense writeback).
         """
+        # Streaming-KV window in TOKENS (sink + recency blocks). None -> dense prefix (baseline arm).
+        block_kv_window = (n_sink * block_size, n_recency * block_size) if kv_mode == "streaming" else None
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
         # batch>1 supported via union of active positions across sequences (batch-union: a position is
@@ -861,6 +871,7 @@ class Fast_dLLM_QwenForCausalLM:
                                 update_past_key_values=False,
                                 use_block_cache=True,
                                 output_hidden_states=True,
+                                kv_window=block_kv_window,
                             )
                             block_past_key_values = output.block_past_key_values
                             hidden_block = output.hidden_states[-1]
@@ -893,6 +904,7 @@ class Fast_dLLM_QwenForCausalLM:
                                     block_past_key_values=block_past_key_values,
                                     replace_positions=active_positions,
                                     output_hidden_states=True,
+                                    kv_window=block_kv_window,
                                 )
                                 block_past_key_values = output.block_past_key_values
                                 hidden_block = output.hidden_states[-1]
@@ -924,6 +936,7 @@ class Fast_dLLM_QwenForCausalLM:
                                     block_past_key_values=block_past_key_values,
                                     replace_positions=active_positions,
                                     output_hidden_states=True,
+                                    kv_window=block_kv_window,
                                 )
                                 block_past_key_values = output.block_past_key_values
                                 hidden_active = output.hidden_states[-1]
@@ -947,6 +960,7 @@ class Fast_dLLM_QwenForCausalLM:
                                     block_past_key_values=block_past_key_values,
                                     replace_positions=active_positions,
                                     output_hidden_states=True,
+                                    kv_window=block_kv_window,
                                 )
                                 block_past_key_values = output.block_past_key_values
                                 hidden_active = output.hidden_states[-1]

@@ -188,6 +188,7 @@ class Fast_dLLM_QwenAttention(nn.Module):
         block_past_key_values: Optional[Cache] = None,
         replace_position: Optional[int] = None,
         replace_positions: Optional[torch.LongTensor] = None,
+        kv_window: Optional[tuple] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -237,8 +238,20 @@ class Fast_dLLM_QwenAttention(nn.Module):
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             elif len(past_key_value) > self.layer_idx:
-                key_states = torch.cat((past_key_value[self.layer_idx][0], key_states), dim=-2)
-                value_states = torch.cat((past_key_value[self.layer_idx][1], value_states), dim=-2)
+                prefix_k = past_key_value[self.layer_idx][0]
+                prefix_v = past_key_value[self.layer_idx][1]
+                if kv_window is not None:
+                    # Streaming-KV read: keep only the first n_sink + last n_recency prefix tokens.
+                    # Absolute rope stays baked into the kept keys, and the block-token cache_position
+                    # is computed from the FULL (untruncated) cache -> positions stay correct. This is
+                    # the retrieval-preserving StreamingLLM variant (the "cheap KV" arm).
+                    n_sink, n_rec = kv_window
+                    Lp = prefix_k.shape[-2]
+                    if Lp > n_sink + n_rec:
+                        prefix_k = torch.cat((prefix_k[:, :, :n_sink, :], prefix_k[:, :, Lp - n_rec:, :]), dim=-2)
+                        prefix_v = torch.cat((prefix_v[:, :, :n_sink, :], prefix_v[:, :, Lp - n_rec:, :]), dim=-2)
+                key_states = torch.cat((prefix_k, key_states), dim=-2)
+                value_states = torch.cat((prefix_v, value_states), dim=-2)
 
         if self.training:
             attn_output = fused_flex_attention(query_states, key_states, value_states, mask=attention_mask)
@@ -310,6 +323,7 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
         block_past_key_values: Optional[Cache] = None,
         replace_position: Optional[int] = None,
         replace_positions: Optional[torch.LongTensor] = None,
+        kv_window: Optional[tuple] = None,
         **kwargs
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
@@ -328,6 +342,7 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
             block_past_key_values=block_past_key_values,
             replace_position=replace_position,
             replace_positions=replace_positions,
+            kv_window=kv_window,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -476,6 +491,7 @@ class Fast_dLLM_QwenModel(Fast_dLLM_QwenPreTrainedModel):
         replace_positions: Optional[torch.LongTensor] = None,
         skip_layer_mask: Optional[torch.BoolTensor] = None,
         collect_layer_policy_cos: Optional[bool] = False,
+        kv_window: Optional[tuple] = None,
         **kwargs
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -575,6 +591,7 @@ class Fast_dLLM_QwenModel(Fast_dLLM_QwenPreTrainedModel):
                 block_past_key_values=block_past_key_values,
                 replace_position=replace_position,
                 replace_positions=replace_positions,
+                kv_window=kv_window,
                 **kwargs,
             )
             if layer_policy_cos is not None:
@@ -650,6 +667,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         skip_layer_mask: Optional[torch.BoolTensor] = None,
         collect_layer_policy_cos: Optional[bool] = False,
         mask_id: Optional[int] = 151665,
+        kv_window: Optional[tuple] = None,
         **kwargs
     ) -> CausalLMOutputWithPastAndBlockCache:
 
@@ -704,6 +722,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             replace_position=replace_position,
             skip_layer_mask=skip_layer_mask,
             collect_layer_policy_cos=collect_layer_policy_cos,
+            kv_window=kv_window,
             **kwargs,
         )
 
@@ -764,6 +783,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         replace_positions: torch.LongTensor,
         output_hidden_states: bool = True,
         skip_layer_mask: Optional[torch.BoolTensor] = None,
+        kv_window: Optional[tuple] = None,
     ) -> CausalLMOutputWithPastAndBlockCache:
         """
         Sparse block forward helper: update block_past_key_values only for arbitrary positions.
@@ -779,6 +799,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             replace_positions=replace_positions,
             skip_layer_mask=skip_layer_mask,
             output_hidden_states=output_hidden_states,
+            kv_window=kv_window,
         )
 
     @torch.no_grad()

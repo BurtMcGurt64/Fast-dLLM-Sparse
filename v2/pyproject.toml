@@ -18,8 +18,9 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [[tool.uv.index]]
+name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "...", url = "https://download.pytorch.org/whl/cu128" }
+torch = { index = "pytorch-cu128" }

@@ -103,6 +103,11 @@ def main():
     p.add_argument("--batch_sizes", default="1,4,8,16")
     p.add_argument("--metric", default="l2", choices=["cosine", "l2"])
     p.add_argument("--thr", type=float, default=0.02, help="freeze threshold (l2~0.02, cosine~0.99)")
+    p.add_argument("--kv_mode", default="none", choices=["none", "streaming", "compose"],
+                   help="none=token policy only; streaming=token+KV window; "
+                        "compose=run BOTH (token-only and token+KV) per batch to show the roofline crossover")
+    p.add_argument("--n_sink", type=int, default=2, help="streaming: prefix BLOCKS kept at the front")
+    p.add_argument("--n_recency", type=int, default=4, help="streaming: prefix BLOCKS kept at the end")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -131,9 +136,21 @@ def main():
     tokp = types.MethodType(GF.Fast_dLLM_QwenForCausalLM.batch_sample_token_policy_flashattention, model)
     GF.set_staleness_metric(args.metric)
 
-    print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}), GSM8K n={args.n}\n"
-          f"(accuracy at bs>1 may be unreliable — ragged prompts; skip-fraction + tok/s are the signal)")
-    print(f"  {'bs':>3} {'ORG t/s':>8} {'pol t/s':>8} {'speedup':>8} {'skip%':>6} {'ORG acc':>8} {'pol acc':>8}")
+    # Which token-policy arms to run per batch. compose = both, to expose the roofline crossover.
+    kv_arms = [("none", None)]
+    if args.kv_mode == "streaming":
+        kv_arms = [("stream", dict(kv_mode="streaming", n_sink=args.n_sink, n_recency=args.n_recency))]
+    elif args.kv_mode == "compose":
+        kv_arms = [("none", None),
+                   ("stream", dict(kv_mode="streaming", n_sink=args.n_sink, n_recency=args.n_recency))]
+
+    win = f", KV sink={args.n_sink}+rec={args.n_recency} blk" if args.kv_mode != "none" else ""
+    print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}{win}), GSM8K n={args.n}")
+    print("  compute axis = token policy (query rows); memory axis = streaming KV (prefix bytes).")
+    hdr = f"  {'bs':>3} {'ORG t/s':>8}"
+    for name, _ in kv_arms:
+        hdr += f" | {name:>6} t/s  spd  skip%  acc"
+    print(hdr)
     ulen = 0
     if args.uniform:
         ulen = max(tok(GSM8K_FEWSHOT + f"Question: {q}\nAnswer:", return_tensors="pt").input_ids.shape[1]
@@ -142,14 +159,18 @@ def main():
     for bs in [int(x) for x in args.batch_sizes.split(",")]:
         batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
         org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen)
-        acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen,
-                             token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
-        spd = tps / org_tps if org_tps else 0.0
-        print(f"  {bs:>3} {org_tps:>8.1f} {tps:>8.1f} {spd:>7.2f}x {skip:>5.0%} {org_acc:>8.3f} {acc:>8.3f}",
-              flush=True)
-    print("\n  Read: does skip% hold as bs grows, and does speedup ever exceed 1? If skip% collapses")
-    print("  with batch (batch-union) or speedup stays <=1, the union approach is capped -> a ragged")
-    print("  (varlen) kernel would be needed for real per-sequence saving.")
+        row = f"  {bs:>3} {org_tps:>8.1f}"
+        for name, kvkw in kv_arms:
+            extra = dict(token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
+            if kvkw:
+                extra.update(kvkw)
+            acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen, **extra)
+            spd = tps / org_tps if org_tps else 0.0
+            row += f" | {tps:>8.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
+        print(row, flush=True)
+    print("\n  Crossover read: 'stream' should help most at LOW batch (memory-bound: KV bytes dominate),")
+    print("  'none' (token policy) at HIGH batch (compute-bound: query rows dominate). If 'stream' never")
+    print("  beats 'none', the two are pure substitutes here and composition adds nothing at this shape.")
 
 
 if __name__ == "__main__":
