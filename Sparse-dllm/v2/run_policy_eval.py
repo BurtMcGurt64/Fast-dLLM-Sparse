@@ -77,11 +77,17 @@ def qa_f1(pred_text, answers):
     return best
 
 def load_longbench(lb_task, n, ctx_tokens, tok, seed):
-    """Head+tail-truncate each example's (context+question) to ctx_tokens; return (enc_1d, answers)."""
-    from datasets import load_dataset
-    ds = load_dataset("THUDM/LongBench", lb_task, split="test").shuffle(seed=seed).select(range(n))
+    """Head+tail-truncate each example's (context+question) to ctx_tokens; return (enc_1d, answers).
+    Downloads the raw jsonl directly (newer `datasets` refuses the LongBench.py loader script)."""
+    import json, random
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download("THUDM/LongBench", f"data/{lb_task}.jsonl", repo_type="dataset")
+    with open(path) as f:
+        rows = [json.loads(line) for line in f]
+    random.Random(seed).shuffle(rows)
+    rows = rows[:n]
     out = []
-    for ex in ds:
+    for ex in rows:
         prompt = f"{ex['context']}\n\nQuestion: {ex['input']}\nAnswer:"
         ids = tok(prompt, return_tensors="pt").input_ids[0]
         if ids.shape[0] > ctx_tokens:               # LongBench-style middle truncation
