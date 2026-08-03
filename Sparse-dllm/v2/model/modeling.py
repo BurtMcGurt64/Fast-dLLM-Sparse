@@ -240,11 +240,14 @@ class Fast_dLLM_QwenAttention(nn.Module):
             elif len(past_key_value) > self.layer_idx:
                 prefix_k = past_key_value[self.layer_idx][0]
                 prefix_v = past_key_value[self.layer_idx][1]
-                if kv_window is not None:
+                if kv_window is not None and attention_mask is None:
                     # Streaming-KV read: keep only the first n_sink + last n_recency prefix tokens.
                     # Absolute rope stays baked into the kept keys, and the block-token cache_position
                     # is computed from the FULL (untruncated) cache -> positions stay correct. This is
                     # the retrieval-preserving StreamingLLM variant (the "cheap KV" arm).
+                    # Gated on attention_mask is None: only the mask-free small-step regime (block cache
+                    # populated). The per-block init forward carries an eval_mask sized to the full prefix,
+                    # so it stays dense (first-block-dense convention) to keep mask/key shapes aligned.
                     n_sink, n_rec = kv_window
                     Lp = prefix_k.shape[-2]
                     if Lp > n_sink + n_rec:
