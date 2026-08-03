@@ -355,6 +355,13 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
         if _cap:
             self._attn_contrib = (hidden_states.float().norm(dim=-1)
                                   / residual.float().norm(dim=-1).clamp_min(1e-6)).detach()
+        # Interventional probe: residual-skip attention for selected positions (SkipGPT semantics =
+        # replace module output with 0 so only the residual passes through). _skip_attn_pos is a
+        # bool mask [B,T] or a 1-D LongTensor of positions.
+        _sa = getattr(self, "_skip_attn_pos", None)
+        if _sa is not None:
+            hidden_states = hidden_states.clone()
+            hidden_states[:, _sa, :] = 0.0
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -364,6 +371,10 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
         if _cap:
             self._ffn_contrib = (hidden_states.float().norm(dim=-1)
                                  / residual.float().norm(dim=-1).clamp_min(1e-6)).detach()
+        _sf = getattr(self, "_skip_ffn_pos", None)
+        if _sf is not None:
+            hidden_states = hidden_states.clone()
+            hidden_states[:, _sf, :] = 0.0
         hidden_states = residual + hidden_states
         return hidden_states
 
