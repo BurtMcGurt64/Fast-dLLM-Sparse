@@ -348,12 +348,22 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
             kv_window=kv_window,
             **kwargs,
         )
+        # Per-module contribution probe: relative norm of the module output vs its residual input,
+        # per token. attn_contrib[b,t] = ||attn(x)|| / ||x||; a small value => this module barely
+        # changes this token => skippable. Used to test convergence-conditional layer redundancy.
+        _cap = getattr(self, "_capture_contrib", False)
+        if _cap:
+            self._attn_contrib = (hidden_states.float().norm(dim=-1)
+                                  / residual.float().norm(dim=-1).clamp_min(1e-6)).detach()
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if _cap:
+            self._ffn_contrib = (hidden_states.float().norm(dim=-1)
+                                 / residual.float().norm(dim=-1).clamp_min(1e-6)).detach()
         hidden_states = residual + hidden_states
         return hidden_states
 
