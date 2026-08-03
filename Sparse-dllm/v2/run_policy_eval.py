@@ -78,12 +78,18 @@ def qa_f1(pred_text, answers):
 
 def load_longbench(lb_task, n, ctx_tokens, tok, seed):
     """Head+tail-truncate each example's (context+question) to ctx_tokens; return (enc_1d, answers).
-    Downloads the raw jsonl directly (newer `datasets` refuses the LongBench.py loader script)."""
-    import json, random
+    Reads the task jsonl straight out of the repo's data.zip (newer `datasets` refuses the
+    LongBench.py loader script; the repo stores all tasks inside a single data.zip)."""
+    import json, random, zipfile, io
     from huggingface_hub import hf_hub_download
-    path = hf_hub_download("THUDM/LongBench", f"data/{lb_task}.jsonl", repo_type="dataset")
-    with open(path) as f:
-        rows = [json.loads(line) for line in f]
+    zpath = hf_hub_download("zai-org/LongBench", "data.zip", repo_type="dataset")
+    with zipfile.ZipFile(zpath) as zf:
+        member = next((m for m in zf.namelist() if m.rstrip("/").endswith(f"{lb_task}.jsonl")), None)
+        if member is None:
+            avail = sorted(m.split("/")[-1][:-6] for m in zf.namelist() if m.endswith(".jsonl"))
+            raise ValueError(f"LongBench task '{lb_task}' not in data.zip. Available: {avail}")
+        with zf.open(member) as f:
+            rows = [json.loads(line) for line in io.TextIOWrapper(f, encoding="utf-8")]
     random.Random(seed).shuffle(rows)
     rows = rows[:n]
     out = []
