@@ -49,7 +49,7 @@ def pred(t):
     n = re.findall(r"-?[\d,]+", t); return n[-1].replace(",", "") if n else None
 
 
-def make_batches(data, tok, bs, device):
+def make_batches(data, tok, bs, device, uniform_len=0):
     pad = tok.pad_token_id if tok.pad_token_id is not None else 151645
     tok.pad_token = tok.pad_token or tok.eos_token
     out = []
@@ -57,12 +57,18 @@ def make_batches(data, tok, bs, device):
         chunk = data[i:i + bs]
         encs = [tok(GSM8K_FEWSHOT + f"Question: {q}\nAnswer:", return_tensors="pt").input_ids[0] for q, _ in chunk]
         lens = [e.shape[0] for e in encs]
-        L = max(lens)
+        L = uniform_len if uniform_len else max(lens)
         ids = torch.full((len(encs), L), pad, dtype=torch.long)
         for j, e in enumerate(encs):
+            e = e[-L:]                              # safety: keep the rightmost L if longer than uniform_len
             ids[j, L - e.shape[0]:] = e            # left-pad
-        out.append((ids.to(device), torch.tensor(lens, device=device), min(lens),
-                    [g for _, g in chunk]))
+        if uniform_len:                            # uniform: treat full padded length as the prompt -> clean, non-ragged batch
+            seq_len = torch.full((len(encs),), L, device=device)
+            min_len = L
+        else:
+            seq_len = torch.tensor(lens, device=device)
+            min_len = min(lens)
+        out.append((ids.to(device), seq_len, min_len, [g for _, g in chunk]))
     return out
 
 
@@ -89,7 +95,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Efficient-Large-Model/Fast_dLLM_v2_7B")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--n", type=int, default=64)
+    p.add_argument("--n", type=int, default=200)
+    p.add_argument("--uniform", action="store_true",
+                   help="pad ALL prompts to one length -> non-ragged batches -> trustworthy bs>1 accuracy")
     p.add_argument("--gen", type=int, default=256)
     p.add_argument("--freeze", type=int, default=3)
     p.add_argument("--batch_sizes", default="1,4,8,16")
@@ -126,8 +134,13 @@ def main():
     print(f"\nBatch sweep — token policy ({args.metric} thr={args.thr}, freeze={args.freeze}), GSM8K n={args.n}\n"
           f"(accuracy at bs>1 may be unreliable — ragged prompts; skip-fraction + tok/s are the signal)")
     print(f"  {'bs':>3} {'ORG t/s':>8} {'pol t/s':>8} {'speedup':>8} {'skip%':>6} {'ORG acc':>8} {'pol acc':>8}")
+    ulen = 0
+    if args.uniform:
+        ulen = max(tok(GSM8K_FEWSHOT + f"Question: {q}\nAnswer:", return_tensors="pt").input_ids.shape[1]
+                   for q, _ in data)
+        print(f"  (uniform batching: all prompts padded to {ulen} tokens)")
     for bs in [int(x) for x in args.batch_sizes.split(",")]:
-        batches = make_batches(data, tok, bs, args.device)
+        batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
         org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen)
         acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen,
                              token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
