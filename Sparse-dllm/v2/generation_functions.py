@@ -185,7 +185,7 @@ class Fast_dLLM_QwenForCausalLM:
         # only prefix cache if min_len > block_size
         if min_len > block_size:
             prefill_tokens = int(min_len // block_size * block_size)
-            output = self.forward(input_ids=input_ids[:, :prefill_tokens], use_cache=True, update_past_key_values=True, block_size=block_size)
+            output = self.forward(input_ids=input_ids[:, :prefill_tokens], use_cache=True, update_past_key_values=True, block_size=block_size, logits_to_keep=1)
             logits, past_key_values = output.logits, output.past_key_values
             if estimate_flops:
                 _record_decode_flops_step(self,
@@ -417,6 +417,7 @@ class Fast_dLLM_QwenForCausalLM:
                 use_cache=True,
                 update_past_key_values=True,
                 block_size=block_size,
+                logits_to_keep=1,   # prefill only needs the last-token logit; avoids [B,L,vocab] lm_head OOM
             )
             logits, past_key_values = output.logits, output.past_key_values
             if estimate_flops:
@@ -754,6 +755,7 @@ class Fast_dLLM_QwenForCausalLM:
                 use_cache=True,
                 update_past_key_values=True,
                 block_size=block_size,
+                logits_to_keep=1,   # prefill only needs the last-token logit; avoids [B,L,vocab] lm_head OOM
             )
             logits, past_key_values = output.logits, output.past_key_values
             if estimate_flops:
@@ -1115,6 +1117,7 @@ class Fast_dLLM_QwenForCausalLM:
                 use_cache=True,
                 update_past_key_values=True,
                 block_size=block_size,
+                logits_to_keep=1,   # prefill only needs the last-token logit; avoids [B,L,vocab] lm_head OOM
             )
             logits, past_key_values = output.logits, output.past_key_values
             if estimate_flops:
