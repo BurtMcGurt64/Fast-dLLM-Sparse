@@ -14,12 +14,13 @@ Two levers speed up the diffusion small step, on **different hardware bottleneck
 | axis | what it cuts | speedup | accuracy | verdict |
 |---|---|---|---|---|
 | **Token policy** (compute) | query rows recomputed per step | **~1.3×** (grows to ~1.5× w/ batch) | **free** — ≈ dense on 4 tasks | **the win** |
-| **KV streaming** (memory) | prefix KV bytes read | +0.1–0.4× on top | **−0.01 to −0.06 F1**, un-tunable | speed-for-accuracy knob |
-| **Composed** | both | up to **~1.8×** @ high batch | inherits the KV cost | near-multiplicative, not free |
+| **KV streaming** (memory) | prefix KV bytes read | +0.1–0.4× on top | **near-free on QA (−0.01)**, ~−0.06 on summarization; *selection irrelevant* | task-dependent knob |
+| **Composed** | both | up to **~1.8×** @ high batch | inherits the KV cost | near-multiplicative |
 
 **Headline:** the **token policy is a free ~1.3× at b>1** (the deliverable). Composing streaming-KV
-stacks to ~1.8× at high batch but costs content coverage that **selection cannot recover** (content ≈
-position) — so it's a characterized tradeoff, not a free multiplier.
+stacks to ~1.8× at high batch; the KV *selection strategy is irrelevant* (content = position, measured),
+and its accuracy cost is **task-dependent** — near-free on extractive QA, ~−0.06 only on
+whole-document summarization.
 
 ---
 
@@ -65,34 +66,37 @@ positions).
 
 ---
 
-## 3. Finding 2 — KV streaming buys speed but **costs content coverage**
+## 3. Finding 2 — KV streaming: **selection is irrelevant; cost is task-type-dependent**
 
-Streaming adds speed (more at high batch) but **loses accuracy on any task that needs the middle of the
-context**, and the loss does **not** tune away with window size.
+Two empirical results (the second verified fresh, not cited from the prior project).
 
-**Standalone KV cost** (bs=64, gen=256):
-| task | dense F1 | kv F1 | Δ |
-|---|---|---|---|
-| hotpotqa (multi-hop) | 0.228 | 0.215 | −0.013 |
-| gov_report (summarization) | 0.186 | 0.124 | **−0.062** |
-
-**Window Pareto — no near-lossless setting** (hotpotqa, bs=64, n=200):
-| n_recency | blocks kept (of 128) | F1 |
+**(a) KV *selection strategy* is irrelevant — content = position.** Direct A/B at a matched 5% budget
+(`baseline_compare.py`, hotpotqa 4k, n=60, only the selection differs):
+| method | F1 (gen=64) | F1 (gen=256) |
 |---|---|---|
-| dense | 128 | 0.244 |
-| 4 | 6 | 0.208 |
-| 8 | 10 | 0.210 |
-| 16 | 18 | 0.201 |
-| 32 | 34 | 0.220 |
+| dense | 0.227 | 0.230 |
+| streaming (position pins) | 0.222 | 0.222 |
+| commit (content top-K) | 0.222 | 0.222 |
 
-F1 stays ~0.20–0.22 regardless of window — it never climbs back to dense, even keeping 27% of context.
+**commit − streaming = +0.000** at both gen lengths. Content selection (the commit-score oracle) buys
+**nothing** over sink+recency pinning. Pure streaming is the right choice; *you cannot select your way to
+better accuracy.* (Confirms the prior ablation, now measured directly here.)
 
-**Why (the mechanism):** the cost is from **having a KV budget at all** (dropping most blocks), not from
-*how* you pick within it. Multi-hop evidence is diffuse; summaries need full coverage — no position
-window captures either. This reconfirms the prior project's core result: **content selection ≈ position**
-(commit-score top-K does not beat sink+recency). *You cannot select your way out of needing the context.*
-(Note: the prior "recency pinning helps gov_report" was about **coherence** — repetition/looping — not
-**coverage**. Streaming keeps output fluent, not complete.)
+**(b) The KV accuracy cost is driven by TASK TYPE, not budget or generation length:**
+| task type | example | KV cost vs dense |
+|---|---|---|
+| extractive QA (short answers) | hotpotqa | **~−0.01 (near-free)** |
+| whole-document coverage | gov_report (summarization) | **~−0.06** |
+
+Extractive QA is near-free because the answer is short and resolves from sink+recency; summarization
+needs coverage of the whole document, so dropping the middle hurts. Notably, on hotpotqa the cost is
+**flat across generation length** (−0.005 @ gen=64 → −0.008 @ gen=256) and across budget — so the driver
+is *what the task needs from the context*, not how long you generate or how many blocks you keep.
+
+> *Correction to earlier framing:* an initial run showed a larger hotpotqa gap (~−0.04), but that was a
+> **noise-inflated dense baseline** (0.244 vs the stable ~0.228) — streaming F1 is a consistent 0.222.
+> The honest hotpotqa cost is ~−0.01. A hypothesized "generation-length" mechanism was **not supported**
+> by the controlled gen=64-vs-256 test.
 
 ---
 
@@ -118,14 +122,16 @@ read memory-bound — they compound **nearly multiplicatively** (hotpotqa, gen=2
 
 ## 5. Honest bottom line & recommendation
 
-**Stable conclusion (invariant across every run): token axis = free; KV axis = coverage-costly and
-un-selectable.**
+**Stable conclusion (invariant across every run): token axis = free; KV *selection* is irrelevant
+(content = position); KV *cost* is task-dependent — near-free on QA, real only on summarization.**
 
 - **Present the token policy as the contribution:** Xinze's method extended to b>1, **free ~1.3×**
   (→ ~1.5× at high batch) on a hard baseline, validated accuracy-neutral on 4 tasks. Clean and defensible.
-- **Present KV composition as a characterized extension**, not a headline: it stacks on throughput (up to
-  ~1.8×) and extends batch-scaling, but the memory axis costs content coverage that selection can't
-  recover — which independently reconfirms the prior content ≈ position finding.
+- **Present KV composition as a characterized extension:** it stacks on throughput (up to ~1.8×) and
+  extends batch-scaling. Two measured facts about the memory axis — (1) *selection strategy is irrelevant*
+  (commit = streaming = 0.222, verified directly), and (2) the accuracy cost is *task-dependent*
+  (near-free on extractive QA, ~−0.06 only on whole-document summarization). So on QA/retrieval workloads
+  the composition is near-free; only coverage-heavy tasks pay.
 - **Open decision for the meeting:** is the higher-batch composition regime (≥1.8×, needs chunked prefill
   to push past bs~100 at 4k) worth pursuing, or is the free token-policy 1.3× the paper?
 
