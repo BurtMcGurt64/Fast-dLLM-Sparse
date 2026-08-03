@@ -171,6 +171,8 @@ def main():
     p.add_argument("--lb_tasks", default="", help="comma-sep LongBench subsets; loops over each (overrides --lb_task). "
                                                  "Use with --kv_mode none for the headline token-only x task x batch table")
     p.add_argument("--ctx", type=int, default=4096, help="longbench: truncate each prompt to this many tokens")
+    p.add_argument("--repeat", type=int, default=1,
+                   help="time each config this many times and report MEDIAN tok/s (>=3 for trustworthy speed)")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
@@ -218,11 +220,26 @@ def main():
         data = load_longbench(spec, args.n, args.ctx, tok, args.seed)
         return data, qa_f1, f"LongBench/{spec} ctx<={args.ctx} n={args.n} (metric=token-F1)"
 
+    import statistics
+    def timed(sampler, batches, **extra):
+        """Repeat the timed run (median tok/s); acc/skip are deterministic (temp=0) so take first."""
+        res = [run(model, tok, sampler, batches, args.device, args.gen, score_fn, **extra)
+               for _ in range(max(1, args.repeat))]
+        return res[0][0], statistics.median(r[1] for r in res), res[0][2]
+
     # Task list: --lb_tasks (comma-sep longbench) loops; else single --task/--lb_task.
     if args.lb_tasks:
         task_specs = [t.strip() for t in args.lb_tasks.split(",") if t.strip()]
     else:
         task_specs = ["gsm8k"] if args.task == "gsm8k" else [args.lb_task]
+
+    # Warmup: one untimed short generation to trigger CUDA/cuDNN autotuning so the first TIMED config
+    # isn't cold (a cold first config slows ORG -> inflates its speedup ratio and looks non-monotonic).
+    _wd, score_fn, _ = build_task(task_specs[0])
+    _wu = max(e.shape[0] for e, _ in _wd) if args.uniform else 0
+    _wb = make_batches(_wd[:8], tok, min(8, len(_wd)), args.device, uniform_len=_wu)
+    run(model, tok, org, _wb, args.device, 32, score_fn)
+    run(model, tok, tokp, _wb, args.device, 32, score_fn, token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
 
     win = f", KV sink={args.n_sink}+rec={args.n_recency} blk" if args.kv_mode != "none" else ""
     for spec in task_specs:
@@ -239,13 +256,13 @@ def main():
             print(f"  (uniform batching: all prompts padded to {ulen} tokens)")
         for bs in [int(x) for x in args.batch_sizes.split(",")]:
             batches = make_batches(data, tok, bs, args.device, uniform_len=ulen)
-            org_acc, org_tps, _ = run(model, tok, org, batches, args.device, args.gen, score_fn)
+            org_acc, org_tps, _ = timed(org, batches)
             row = f"  {bs:>3} {org_tps:>8.1f} {org_acc:>6.3f}"
             for name, kvkw in kv_arms:
                 extra = dict(token_policy_threshold=args.thr, token_policy_freeze_step=args.freeze)
                 if kvkw:
                     extra.update(kvkw)
-                acc, tps, skip = run(model, tok, tokp, batches, args.device, args.gen, score_fn, **extra)
+                acc, tps, skip = timed(tokp, batches, **extra)
                 spd = tps / org_tps if org_tps else 0.0
                 row += f" | {tps:>9.1f} {spd:>4.2f}x {skip:>4.0%} {acc:>5.3f}"
             print(row, flush=True)
