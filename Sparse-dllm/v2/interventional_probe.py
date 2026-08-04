@@ -399,6 +399,16 @@ def main():
             Kd = np.array([np.concatenate([kvlay_e[(r["ex"], r["layer"], r["tok"])],
                                            kvlay[(r["ex"], r["layer"], r["tok"])]]) for r in grp], dtype=np.float32)
             kd_auc, _ = grouped_cv_auc(Kd, y, groups, n_pca=64)
+            # CAPACITY-FAIRNESS sweep: PCA-64 truncates the 3584-dim hidden (~1% kept) far more than the
+            # 512-dim key (~6% kept). If kv_DELTA only wins because the hidden is truncation-starved, giving
+            # the hidden more components should let it catch up. If kv_DELTA STILL wins un-truncated, the key
+            # is a genuinely better-conditioned feature (real finding), not an artifact.
+            cap_line = "      [cap-fair] "
+            for pc in (128, 256, 0):
+                hdp, _ = grouped_cv_auc(Hd, y, groups, n_pca=pc)
+                kdp, _ = grouped_cv_auc(Kd, y, groups, n_pca=pc)
+                tag = "full" if pc == 0 else str(pc)
+                cap_line += f"pca{tag}: hid {hdp:.3f} / kv {kdp:.3f}   "
             print(f"    [{mod}]  skippable={y.mean():.0%}")
             print(f"      stale_kl (hand)          : CV-AUC {kl_auc:.3f}")
             print(f"      kv_stale (KEY / routing) : CV-AUC {kvs_auc:.3f}   [||ΔK||: how much t's key drifted]")
@@ -410,6 +420,7 @@ def main():
             print(f"      hidden_probe (per-layer) : CV-AUC {hpl_auc:.3f}   <- SkipGPT baseline (1 state)")
             print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}  (fold sd {fold_sd:.3f})  <- fair TEMPORAL baseline")
             print(f"      kv_DELTA (full K vecs)   : CV-AUC {kd_auc:.3f}   <- MATCHED-capacity temporal KV (full K, both states)")
+            print(cap_line + "  <- does hidden catch kv as it gets more capacity? (yes=artifact, no=real)")
             fair = hd_auc if hd_auc == hd_auc else (hpl_auc if hpl_auc == hpl_auc else hp_auc)
             # Noise-aware verdict: require a KV signal (scalar OR the matched-capacity kv_DELTA vector probe)
             # to beat the fair temporal-hidden baseline. Multi-feature scalar-combos overfit small-n noise.
