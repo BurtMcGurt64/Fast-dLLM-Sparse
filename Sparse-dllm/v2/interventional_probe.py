@@ -64,20 +64,27 @@ def _kl(p_logits, q_logits):
     return (p.exp() * (p - q)).sum(dim=-1)
 
 
-def compute_kv_signals(k_early, k_late, q_late, unsettled):
-    """Per-layer, per-token KV-convergence signals (the untested dimension: layer-local + cross-token).
-      kv_stale[l,t] = ||K_t^late - K_t^early|| / ||K_t^early||   (this token's KEY changed across states)
-      kv_infl[l,t]  = (block-local attention INTO t from UNSETTLED tokens) * kv_stale   (cross-token damage)
-    Both are things SkipGPT's per-token final-hidden router cannot see. Block-local softmax over the 32
-    block tokens is a cheap proxy for within-block coupling (ignores prefix competition — noted limit)."""
+def _rel_drift(x_early, x_late):
+    """Per-token relative drift ||x_late - x_early|| / ||x_early|| for a [H, T, d] tensor -> [T]."""
+    xe = x_early.float(); xl = x_late.float(); T = xe.shape[1]
+    num = (xl - xe).transpose(0, 1).reshape(T, -1).norm(dim=1)
+    den = xe.transpose(0, 1).reshape(T, -1).norm(dim=1).clamp_min(1e-6)
+    return (num / den)
+
+
+def compute_kv_signals(k_early, k_late, q_late, v_early, v_late, unsettled):
+    """Per-layer, per-token KV-convergence signals.
+      kv_stale[l,t] = ||ΔK_t||/||K_t||   (ROUTING channel: how much t's key changed)
+      v_stale[l,t]  = ||ΔV_t||/||V_t||   (CONTENT channel: how much t's value changed — what others copy)
+      kv_infl[l,t]  = (block-local attention INTO t from UNSETTLED tokens) * kv_stale   (cross-token)
+    K/V are what OTHERS read from t; SkipGPT's per-token final-hidden router cannot see either. Block-local
+    softmax over the 32 block tokens is a cheap proxy for within-block coupling (ignores prefix — noted)."""
     out = {}
     uns = unsettled.detach().cpu()
     for l in range(len(k_late)):
-        ke = k_early[l][0].float(); kl = k_late[l][0].float()           # [H_kv, T, d]
-        T = ke.shape[1]
-        dnum = (kl - ke).transpose(0, 1).reshape(T, -1).norm(dim=1)     # [T]
-        dden = ke.transpose(0, 1).reshape(T, -1).norm(dim=1).clamp_min(1e-6)
-        kv_stale = (dnum / dden).cpu()                                  # [T]
+        kl = k_late[l][0].float()
+        kv_stale = _rel_drift(k_early[l][0], kl).cpu()                  # [T] routing channel
+        v_stale = _rel_drift(v_early[l][0], v_late[l][0]).cpu()         # [T] content channel
 
         q = q_late[l][0].float(); H = q.shape[0]; d = q.shape[-1]        # q: [H, T, d]
         H_kv = kl.shape[0]
@@ -87,7 +94,7 @@ def compute_kv_signals(k_early, k_late, q_late, unsettled):
             into_t = A[:, uns, :].mean(dim=(0, 1)).cpu()               # attn INTO each key t from unsettled queries
         else:
             into_t = A.mean(dim=(0, 1)).cpu()
-        out[l] = (kv_stale.numpy(), (into_t * kv_stale).numpy())
+        out[l] = (kv_stale.numpy(), (into_t * kv_stale).numpy(), v_stale.numpy())
     return out
 
 
@@ -132,9 +139,11 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     set_cap(True)
     logits_e, h_e = block_forward(model, early, pkv)
     k_early = [lyr.self_attn._k_snap.clone() for lyr in model.model.layers]     # per layer [1,H_kv,T,d]
+    v_early = [lyr.self_attn._v_snap.clone() for lyr in model.model.layers]
     preattn_e, premlp_e = grab_hidden()                                 # per-layer hidden at EARLY state
     logits_l, h_l = block_forward(model, late, pkv)                      # reference state
     k_late = [lyr.self_attn._k_snap.clone() for lyr in model.model.layers]
+    v_late = [lyr.self_attn._v_snap.clone() for lyr in model.model.layers]
     q_late = [lyr.self_attn._q_snap.clone() for lyr in model.model.layers]
     preattn, premlp = grab_hidden()                                     # per-layer hidden at LATE state
     set_cap(False)
@@ -144,7 +153,7 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     settled = (late[0] != MASK_ID).cpu().numpy().astype(float)          # baseline: is-settled flag
     unsettled = (late[0] == MASK_ID)                                    # bool [T]
     hnorm = h_l[0].float().norm(dim=-1).cpu().numpy()                   # baseline: raw ||hidden||
-    kv_signals = compute_kv_signals(k_early, k_late, q_late, unsettled)  # {layer: (kv_stale[T], kv_infl[T])}
+    kv_signals = compute_kv_signals(k_early, k_late, q_late, v_early, v_late, unsettled)  # {l: (kv_stale, kv_infl, v_stale)}
     ref = logits_l                                                      # [1,T,V]
     ref_arg = ref.argmax(-1)[0]                                         # [T] reference decoded ids
 
@@ -159,14 +168,14 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
                 flip = (skip_logits.argmax(-1)[0] != ref_arg)          # [T] bool: did the argmax flip
                 local_flip = int(flip[t].item())                       # ABSOLUTE, comparable label
                 cross_flip = (int(flip.sum().item()) - local_flip) / (BLOCK - 1)  # leakage into others
-                kv_s, kv_i = kv_signals[l]
+                kv_s, kv_i, v_s = kv_signals[l]
                 rows.append(dict(layer=l, mod=mod, tok=t,
                                  local_flip=local_flip, cross_flip=cross_flip,
                                  local_kl=kl_all[t].item(),
                                  cross_kl=(kl_all.sum().item() - kl_all[t].item()) / (BLOCK - 1),
                                  stale_l2=float(stale_l2[t]), stale_kl=float(stale_kl[t]),
                                  settled=float(settled[t]), hnorm=float(hnorm[t]),
-                                 kv_stale=float(kv_s[t]), kv_infl=float(kv_i[t])))
+                                 kv_stale=float(kv_s[t]), kv_infl=float(kv_i[t]), v_stale=float(v_s[t])))
     # Full late-hidden per token (final) + per-layer pre-module hidden at LATE and EARLY states
     # (EARLY enables the hidden-DELTA baseline: same temporal info as KV, but on the hidden not the key).
     hidden_np = h_l[0].float().cpu().numpy().astype(np.float16)          # [T, D]
@@ -272,7 +281,7 @@ def main():
     if not rows:
         print("no data"); return
     depth_of = lambda l: "early" if l < L / 3 else ("mid" if l < 2 * L / 3 else "late")
-    preds = ["hnorm", "settled", "stale_l2", "stale_kl", "kv_stale", "kv_infl"]
+    preds = ["hnorm", "settled", "stale_l2", "stale_kl", "kv_stale", "v_stale", "kv_infl"]
 
     def disc_auc(grp, pred):
         """Discrimination AUC (direction-agnostic): how well `pred` separates skippable (argmax
@@ -355,12 +364,15 @@ def main():
                 return max(a, 1 - a) if a == a else a
             kl_auc = scalar_cv("stale_kl")
             kvs_auc = scalar_cv("kv_stale")
+            vs_auc = scalar_cv("v_stale")
             kvi_auc = scalar_cv("kv_infl")
             learned = np.array([[r["stale_kl"], r["stale_l2"], r["hnorm"], r["settled"]] for r in grp])
             ls_auc, _ = grouped_cv_auc(learned, y, groups)
-            # KV combo = the untested dimension on its own (kv_stale + cross-token kv_infl)
+            # KV combo = key routing + cross-token; KVV combo also adds the value/content channel.
             kvcombo = np.array([[r["kv_stale"], r["kv_infl"]] for r in grp])
             kvc_auc, _ = grouped_cv_auc(kvcombo, y, groups)
+            kvvcombo = np.array([[r["kv_stale"], r["v_stale"], r["kv_infl"]] for r in grp])
+            kvv_auc, _ = grouped_cv_auc(kvvcombo, y, groups)
             H = np.array([hiddens[(r["ex"], r["tok"])] for r in grp], dtype=np.float32)
             hp_auc, _ = grouped_cv_auc(H, y, groups, n_pca=64)
             # FAIR SkipGPT baseline: per-layer pre-module hidden (its ACTUAL router input, layer-local, 1 state).
@@ -373,13 +385,15 @@ def main():
             hd_auc, _ = grouped_cv_auc(Hd, y, groups, n_pca=64)
             print(f"    [{mod}]  skippable={y.mean():.0%}")
             print(f"      stale_kl (hand)          : CV-AUC {kl_auc:.3f}")
-            print(f"      kv_stale (KV key-drift)  : CV-AUC {kvs_auc:.3f}   [layer-local key delta]")
-            print(f"      kv_infl (KV cross-tok)   : CV-AUC {kvi_auc:.3f}   [into-t attn from unsettled x delta]")
-            print(f"      kv_combo                 : CV-AUC {kvc_auc:.3f}   (kv_stale + kv_infl)")
+            print(f"      kv_stale (KEY / routing) : CV-AUC {kvs_auc:.3f}   [||ΔK||: how much t's key drifted]")
+            print(f"      v_stale  (VALUE/ content): CV-AUC {vs_auc:.3f}   [||ΔV||: how much t's value drifted]")
+            print(f"      kv_infl  (KEY cross-tok) : CV-AUC {kvi_auc:.3f}   [into-t attn from unsettled x ΔK]")
+            print(f"      kv_combo   (K + cross)   : CV-AUC {kvc_auc:.3f}")
+            print(f"      kvv_combo  (K + V +cross): CV-AUC {kvv_auc:.3f}   <- full KV (routing+content)")
             print(f"      hidden_probe (per-layer) : CV-AUC {hpl_auc:.3f}   <- SkipGPT baseline (1 state)")
             print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}   <- SkipGPT + SAME temporal info (2 states)")
             fair = hd_auc if hd_auc == hd_auc else (hpl_auc if hpl_auc == hpl_auc else hp_auc)
-            best_kv = max(v for v in (kvs_auc, kvi_auc, kvc_auc) if v == v)
+            best_kv = max(v for v in (kvs_auc, vs_auc, kvi_auc, kvc_auc, kvv_auc) if v == v)
             if best_kv > fair + 0.02:
                 print(f"      -> KV ({best_kv:.3f}) BEATS hidden-DELTA ({fair:.3f}) -> it's specifically the KEY,")
                 print(f"         not just temporality -> genuinely beyond SkipGPT. Confirm w/ real-traj L2.")

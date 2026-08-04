@@ -219,6 +219,7 @@ class Fast_dLLM_QwenAttention(nn.Module):
         if getattr(self, "_capture_kv", False):
             self._q_snap = query_states.detach()      # [B, H, T, d]
             self._k_snap = key_states.detach()        # [B, H_kv, T, d]
+            self._v_snap = value_states.detach()      # [B, H_kv, T, d]  (content channel)
 
         if block_past_key_values is not None:
             if len(block_past_key_values) <= self.layer_idx:
