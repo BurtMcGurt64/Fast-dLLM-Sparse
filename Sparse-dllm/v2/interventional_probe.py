@@ -382,7 +382,7 @@ def main():
             # If KV still beats this, the signal is specifically the KEY, not just 'having a delta'.
             Hd = np.array([np.concatenate([play_e[(r["ex"], r["layer"], r["tok"], mod)],
                                            play[(r["ex"], r["layer"], r["tok"], mod)]]) for r in grp], dtype=np.float32)
-            hd_auc, _ = grouped_cv_auc(Hd, y, groups, n_pca=64)
+            hd_auc, hd_folds = grouped_cv_auc(Hd, y, groups, n_pca=64)
             print(f"    [{mod}]  skippable={y.mean():.0%}")
             print(f"      stale_kl (hand)          : CV-AUC {kl_auc:.3f}")
             print(f"      kv_stale (KEY / routing) : CV-AUC {kvs_auc:.3f}   [||ΔK||: how much t's key drifted]")
@@ -390,16 +390,23 @@ def main():
             print(f"      kv_infl  (KEY cross-tok) : CV-AUC {kvi_auc:.3f}   [into-t attn from unsettled x ΔK]")
             print(f"      kv_combo   (K + cross)   : CV-AUC {kvc_auc:.3f}")
             print(f"      kvv_combo  (K + V +cross): CV-AUC {kvv_auc:.3f}   <- full KV (routing+content)")
+            fold_sd = float(np.std(hd_folds)) if hd_folds else float("nan")
             print(f"      hidden_probe (per-layer) : CV-AUC {hpl_auc:.3f}   <- SkipGPT baseline (1 state)")
-            print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}   <- SkipGPT + SAME temporal info (2 states)")
+            print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}  (fold sd {fold_sd:.3f})  <- fair baseline")
             fair = hd_auc if hd_auc == hd_auc else (hpl_auc if hpl_auc == hpl_auc else hp_auc)
-            best_kv = max(v for v in (kvs_auc, vs_auc, kvi_auc, kvc_auc, kvv_auc) if v == v)
-            if best_kv > fair + 0.02:
-                print(f"      -> KV ({best_kv:.3f}) BEATS hidden-DELTA ({fair:.3f}) -> it's specifically the KEY,")
-                print(f"         not just temporality -> genuinely beyond SkipGPT. Confirm w/ real-traj L2.")
+            # Noise-aware verdict: require a SINGLE SCALAR KV signal to beat the fair baseline. Multi-feature
+            # combos (kv_combo/kvv_combo) overfit small-n noise, so they don't count for the verdict — a combo
+            # that clears the bar while every scalar sits below it is a false positive (the ffn case).
+            best_scalar = max(v for v in (kvs_auc, vs_auc, kvi_auc) if v == v)
+            best_combo = max(v for v in (kvc_auc, kvv_auc) if v == v)
+            if best_scalar > fair + 0.02:
+                print(f"      -> best SCALAR KV ({best_scalar:.3f}) beats fair ({fair:.3f}) by >0.02 -> KEY-specific")
+                print(f"         signal genuinely beyond SkipGPT (not just temporality). Confirm w/ real-traj L2.")
+            elif best_combo > fair + 0.02:
+                print(f"      -> only the multi-feature COMBO ({best_combo:.3f}) clears fair ({fair:.3f}); every scalar")
+                print(f"         is below it -> likely combo-overfit noise (esp. vs fold sd {fold_sd:.3f}) -> treat as NO effect.")
             else:
-                print(f"      -> KV ({best_kv:.3f}) does NOT beat hidden-DELTA ({fair:.3f}) -> the win was TEMPORALITY,")
-                print(f"         which you could give SkipGPT too -> weaker claim (not key-specific).")
+                print(f"      -> no KV signal beats fair ({fair:.3f}) -> NO key-specific effect here.")
     except ImportError:
         print("  [skipped: scikit-learn not installed -> `uv pip install scikit-learn` and rerun]")
 
