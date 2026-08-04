@@ -99,10 +99,30 @@ CV-AUC (example-held-out), GSM8K, n=16 examples, 7168 interventions:
 | predictor | CV-AUC |
 |---|---|
 | stale_kl | 0.708 |
-| kv_combo | 0.651 |
-| hidden_DELTA (per-layer) | 0.637 |
+| kv_stale (scalar) | 0.560 |
+| v_stale (scalar) | 0.580 |
+| kv_combo (multi-feature) | 0.651 |
+| hidden_DELTA (per-layer) | ~0.62–0.64 |
 
-**KV key-drift wins on attention (0.772 > 0.709) and does NOT win on MLP (0.651 ≈ 0.637).**
+**KV key-drift wins on attention and does NOT win on MLP.** On FFN, every *single scalar* KV signal
+(0.56/0.58/0.61) sits *below* the fair baseline; only multi-feature combos narrowly (and inconsistently
+across runs) clear it — a combo-overfit false positive, not a real effect. The verdict now requires a
+single scalar to beat the baseline. **The effect is module-specific: attention yes, FFN no** — consistent
+with every prior result (FFN has minimal convergence-dependence throughout this study).
+
+### Key vs Value (which KV channel?)
+| channel | CV-AUC (attn) |
+|---|---|
+| **kv_stale = ‖ΔK‖ (KEY / routing)** | **0.744** |
+| v_stale = ‖ΔV‖ (VALUE / content) | 0.641 |
+| kvv_combo (K + V + cross) | 0.766 ≈ kv_combo 0.772 |
+
+**The signal lives in the KEY, not the value.** Value drift is weaker and adds nothing on top of key
+drift (kvv ≈ kv). Interpretation: what predicts attention-skippability is whether the token's *address*
+(how others attend to it) has settled — the key/routing channel — not whether its *content* (value) has.
+This is a sharper claim than "KV drift matters." (Caveat: the probe skips a token's own attention; the
+*deployed* freeze also has others read the token's stale **V** — so the value question may reopen at L2,
+where the intervention matches deployment.)
 
 Supporting structure (Table 1 of the probe): kv_stale is strongest at **early** attention layers
 (AUC 0.845), decaying to ~0.54 at late layers — mechanistically sensible (early attention is where
