@@ -1,7 +1,15 @@
-# KV Key-Drift Predicts Attention-Skippability Beyond SkipGPT (L1 Evidence)
+# KV Key-Drift and Attention-Skippability (L1 Probe) — CLOSED, did not survive stability
 
-**Status:** L1 (fast-proxy) evidence, robust across every fair baseline tested. Pending L2
-(real-trajectory) confirmation before it is a proven result. Fast-dLLM v2 7B, GSM8K, RTX PRO 6000.
+> **⚠️ OUTCOME (n=32 stability check): the effect did NOT hold.** At n=16, key-drift beat the fair
+> baseline 0.744 vs 0.709 (+0.035). At **n=32** the gap collapsed to **0.710 vs 0.700 (+0.010), within
+> the fold noise (sd 0.017)** — and every supporting number regressed with n (headline AUC 0.737→0.708,
+> confound gap +9%→+6%, ρ 0.27→0.14). This is small-sample inflation regressing to ~0. **Conclusion:
+> key-drift is a decent convergence signal (beats KL/hidden-norm) but adds nothing beyond the fair
+> per-layer temporal hidden baseline SkipGPT could use — so it is NOT a novel signal beyond SkipGPT.
+> The layer/module-sparsity leg is closed on L1 evidence. Do not present as a win.** The rest of this
+> doc is the (now-superseded) n=16 optimistic writeup, kept for the record and methodology.
+
+**Status:** CLOSED (n=32 stability negative). Fast-dLLM v2 7B, GSM8K, RTX PRO 6000.
 Code: `interventional_probe.py` + capture hooks in `model/modeling.py`.
 
 ---
