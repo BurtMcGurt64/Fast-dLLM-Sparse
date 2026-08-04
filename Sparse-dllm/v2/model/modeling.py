@@ -214,6 +214,12 @@ class Fast_dLLM_QwenAttention(nn.Module):
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # KV-convergence probe: snapshot this token's OWN block Q/K (post-rope, pre-cache) so the
+        # probe can measure per-layer KV staleness across denoising states and block-local coupling.
+        if getattr(self, "_capture_kv", False):
+            self._q_snap = query_states.detach()      # [B, H, T, d]
+            self._k_snap = key_states.detach()        # [B, H_kv, T, d]
+
         if block_past_key_values is not None:
             if len(block_past_key_values) <= self.layer_idx:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
