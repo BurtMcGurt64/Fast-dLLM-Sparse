@@ -123,6 +123,7 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     def set_cap(v):
         for lyr in model.model.layers:
             lyr.self_attn._capture_kv = v
+            lyr._capture_hidden = v
 
     set_cap(True)
     logits_e, h_e = block_forward(model, early, pkv)
@@ -130,6 +131,9 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     logits_l, h_l = block_forward(model, late, pkv)                      # reference state
     k_late = [lyr.self_attn._k_snap.clone() for lyr in model.model.layers]
     q_late = [lyr.self_attn._q_snap.clone() for lyr in model.model.layers]
+    # Fair SkipGPT baseline: per-layer PRE-attn / PRE-mlp hidden (its actual router input), at the late state.
+    preattn = [lyr._preattn_hidden[0].float().cpu().numpy().astype(np.float16) for lyr in model.model.layers]
+    premlp = [lyr._premlp_hidden[0].float().cpu().numpy().astype(np.float16) for lyr in model.model.layers]
     set_cap(False)
 
     stale_l2 = ((h_l - h_e).float().norm(dim=-1) / h_e.float().norm(dim=-1).clamp_min(1e-6))[0].cpu().numpy()
@@ -160,9 +164,9 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
                                  stale_l2=float(stale_l2[t]), stale_kl=float(stale_kl[t]),
                                  settled=float(settled[t]), hnorm=float(hnorm[t]),
                                  kv_stale=float(kv_s[t]), kv_infl=float(kv_i[t])))
-    # Full late-hidden per token (SkipGPT's real router input) for the trained-probe baseline.
+    # Full late-hidden per token (final) + per-layer pre-module hidden (fair SkipGPT router input).
     hidden_np = h_l[0].float().cpu().numpy().astype(np.float16)          # [T, D]
-    return rows, hidden_np
+    return rows, hidden_np, preattn, premlp                             # preattn/premlp: list[L] of [T,D]
 
 
 def auc(score, label):
@@ -237,7 +241,8 @@ def main():
     win = args.prompt_blocks * BLOCK + BLOCK
 
     rows = []
-    hiddens = {}                                                         # (ex, tok) -> hidden vector
+    hiddens = {}                                                         # (ex, tok) -> final hidden vector
+    play = {}                                                            # (ex, layer, tok, mod) -> per-layer pre-module hidden
     for k in range(args.n):
         s = k * win
         if s + win > stream.shape[0]:
@@ -245,12 +250,16 @@ def main():
         out = probe_one(model, stream[s:s + win], args.prompt_blocks, args.device, layers, seed=args.seed + k)
         if out is None:
             continue
-        r, hid = out
+        r, hid, preattn, premlp = out
         for row in r:
             row["ex"] = k
             rows.append(row)
         for t in range(hid.shape[0]):
             hiddens[(k, t)] = hid[t]
+        for l in layers:
+            for t in range(preattn[l].shape[0]):
+                play[(k, l, t, "attn")] = preattn[l][t]
+                play[(k, l, t, "ffn")] = premlp[l][t]
         print(f"  example {k+1}/{args.n} done ({len(rows)} intervention points)", flush=True)
 
     if not rows:
@@ -347,22 +356,25 @@ def main():
             kvc_auc, _ = grouped_cv_auc(kvcombo, y, groups)
             H = np.array([hiddens[(r["ex"], r["tok"])] for r in grp], dtype=np.float32)
             hp_auc, _ = grouped_cv_auc(H, y, groups, n_pca=64)
+            # FAIR SkipGPT baseline: per-layer pre-module hidden (its ACTUAL router input, layer-local).
+            Hpl = np.array([play[(r["ex"], r["layer"], r["tok"], mod)] for r in grp], dtype=np.float32)
+            hpl_auc, _ = grouped_cv_auc(Hpl, y, groups, n_pca=64)
             print(f"    [{mod}]  skippable={y.mean():.0%}")
-            print(f"      stale_kl (hand)       : CV-AUC {kl_auc:.3f}")
-            print(f"      kv_stale (KV self)    : CV-AUC {kvs_auc:.3f}   [layer-local key delta]")
-            print(f"      kv_infl (KV cross-tok): CV-AUC {kvi_auc:.3f}   [into-t attn from unsettled x delta]")
-            print(f"      kv_combo              : CV-AUC {kvc_auc:.3f}   (kv_stale + kv_infl)")
-            print(f"      learned_scalar        : CV-AUC {ls_auc:.3f}   (kl,l2,hnorm,settled)")
-            print(f"      hidden_probe (SkipGPT): CV-AUC {hp_auc:.3f}   (logistic on full hidden, PCA-64)")
-            if hp_auc == hp_auc:
-                best_kv = max(v for v in (kvs_auc, kvi_auc, kvc_auc) if v == v)
-                if best_kv > hp_auc + 0.02:
-                    print(f"      -> KV signal ({best_kv:.3f}) BEATS hidden ({hp_auc:.3f}) -> a cross-token/KV signal")
-                    print(f"         SkipGPT CANNOT see -> REVIVES the direction (block-diffusion-specific). Confirm w/ L2.")
-                elif kl_auc == kl_auc and kl_auc > hp_auc + 0.02:
-                    print(f"      -> staleness beats hidden -> novel (but see KV row)")
-                else:
-                    print(f"      -> nothing beats hidden ({hp_auc:.3f}) incl. KV -> direction CLOSED (all axes tested)")
+            print(f"      stale_kl (hand)         : CV-AUC {kl_auc:.3f}")
+            print(f"      kv_stale (KV self)      : CV-AUC {kvs_auc:.3f}   [layer-local key delta]")
+            print(f"      kv_infl (KV cross-tok)  : CV-AUC {kvi_auc:.3f}   [into-t attn from unsettled x delta]")
+            print(f"      kv_combo                : CV-AUC {kvc_auc:.3f}   (kv_stale + kv_infl)")
+            print(f"      learned_scalar          : CV-AUC {ls_auc:.3f}   (kl,l2,hnorm,settled)")
+            print(f"      hidden_probe (final)    : CV-AUC {hp_auc:.3f}   (logistic on FINAL hidden, PCA-64)")
+            print(f"      hidden_probe (per-layer): CV-AUC {hpl_auc:.3f}   <- FAIR SkipGPT baseline (per-layer input)")
+            fair = hpl_auc if hpl_auc == hpl_auc else hp_auc
+            best_kv = max(v for v in (kvs_auc, kvi_auc, kvc_auc) if v == v)
+            if best_kv > fair + 0.02:
+                print(f"      -> KV ({best_kv:.3f}) BEATS the FAIR per-layer SkipGPT baseline ({fair:.3f})")
+                print(f"         -> genuinely beyond SkipGPT (block-diffusion KV signal). Confirm w/ real-traj L2.")
+            else:
+                print(f"      -> KV ({best_kv:.3f}) does NOT beat fair per-layer hidden ({fair:.3f}) -> the edge was")
+                print(f"         LAYER-LOCALITY, which SkipGPT already has -> not novel-KV.")
     except ImportError:
         print("  [skipped: scikit-learn not installed -> `uv pip install scikit-learn` and rerun]")
 

@@ -336,6 +336,9 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
         **kwargs
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
+        # Fair-baseline capture: SkipGPT's attn router sees the PRE-ATTENTION hidden (this residual).
+        if getattr(self, "_capture_hidden", False):
+            self._preattn_hidden = residual.detach()
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
@@ -372,6 +375,9 @@ class Fast_dLLM_QwenDecoderLayer(GradientCheckpointingLayer):
 
         # Fully Connected
         residual = hidden_states
+        # Fair-baseline capture: SkipGPT's MLP router sees the PRE-MLP (post-attention) hidden.
+        if getattr(self, "_capture_hidden", False):
+            self._premlp_hidden = residual.detach()
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         if _cap:
