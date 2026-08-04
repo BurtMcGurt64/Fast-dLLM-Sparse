@@ -179,7 +179,13 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
     # Full late-hidden per token (final) + per-layer pre-module hidden at LATE and EARLY states
     # (EARLY enables the hidden-DELTA baseline: same temporal info as KV, but on the hidden not the key).
     hidden_np = h_l[0].float().cpu().numpy().astype(np.float16)          # [T, D]
-    return rows, hidden_np, preattn, premlp, preattn_e, premlp_e
+    # Full per-layer KEY VECTORS at both states -> the matched-capacity temporal-KV probe (kv_DELTA):
+    # a full-vector probe on [K_early, K_late], the true temporal-KV analog of hidden_DELTA.
+    def kflat(klist):
+        return [klist[l][0].transpose(0, 1).reshape(klist[l].shape[2], -1).float().cpu().numpy().astype(np.float16)
+                for l in range(len(klist))]                             # per layer: [T, H_kv*d]
+    kfull_e, kfull_l = kflat(k_early), kflat(k_late)
+    return rows, hidden_np, preattn, premlp, preattn_e, premlp_e, kfull_e, kfull_l
 
 
 def auc(score, label):
@@ -257,6 +263,8 @@ def main():
     hiddens = {}                                                         # (ex, tok) -> final hidden vector
     play = {}                                                            # (ex, layer, tok, mod) -> per-layer late hidden
     play_e = {}                                                          # ... early-state per-layer hidden (for delta)
+    kvlay = {}                                                           # (ex, layer, tok) -> full late KEY vector
+    kvlay_e = {}                                                         # ... early-state full KEY vector (for kv_DELTA)
     for k in range(args.n):
         s = k * win
         if s + win > stream.shape[0]:
@@ -264,7 +272,7 @@ def main():
         out = probe_one(model, stream[s:s + win], args.prompt_blocks, args.device, layers, seed=args.seed + k)
         if out is None:
             continue
-        r, hid, preattn, premlp, preattn_e, premlp_e = out
+        r, hid, preattn, premlp, preattn_e, premlp_e, kfull_e, kfull_l = out
         for row in r:
             row["ex"] = k
             rows.append(row)
@@ -276,6 +284,8 @@ def main():
                 play[(k, l, t, "ffn")] = premlp[l][t]
                 play_e[(k, l, t, "attn")] = preattn_e[l][t]
                 play_e[(k, l, t, "ffn")] = premlp_e[l][t]
+                kvlay[(k, l, t)] = kfull_l[l][t]
+                kvlay_e[(k, l, t)] = kfull_e[l][t]
         print(f"  example {k+1}/{args.n} done ({len(rows)} intervention points)", flush=True)
 
     if not rows:
@@ -383,6 +393,12 @@ def main():
             Hd = np.array([np.concatenate([play_e[(r["ex"], r["layer"], r["tok"], mod)],
                                            play[(r["ex"], r["layer"], r["tok"], mod)]]) for r in grp], dtype=np.float32)
             hd_auc, hd_folds = grouped_cv_auc(Hd, y, groups, n_pca=64)
+            # MATCHED-CAPACITY temporal-KV probe: full KEY vectors at both states = the true temporal-KV
+            # analog of hidden_DELTA. Tests directly whether KV beats hidden on the CONVERGENCE axis at
+            # equal capacity (not scalar-vs-vector). Theory says <= hidden_DELTA (K = proj(hidden)).
+            Kd = np.array([np.concatenate([kvlay_e[(r["ex"], r["layer"], r["tok"])],
+                                           kvlay[(r["ex"], r["layer"], r["tok"])]]) for r in grp], dtype=np.float32)
+            kd_auc, _ = grouped_cv_auc(Kd, y, groups, n_pca=64)
             print(f"    [{mod}]  skippable={y.mean():.0%}")
             print(f"      stale_kl (hand)          : CV-AUC {kl_auc:.3f}")
             print(f"      kv_stale (KEY / routing) : CV-AUC {kvs_auc:.3f}   [||ΔK||: how much t's key drifted]")
@@ -392,21 +408,23 @@ def main():
             print(f"      kvv_combo  (K + V +cross): CV-AUC {kvv_auc:.3f}   <- full KV (routing+content)")
             fold_sd = float(np.std(hd_folds)) if hd_folds else float("nan")
             print(f"      hidden_probe (per-layer) : CV-AUC {hpl_auc:.3f}   <- SkipGPT baseline (1 state)")
-            print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}  (fold sd {fold_sd:.3f})  <- fair baseline")
+            print(f"      hidden_DELTA (per-layer) : CV-AUC {hd_auc:.3f}  (fold sd {fold_sd:.3f})  <- fair TEMPORAL baseline")
+            print(f"      kv_DELTA (full K vecs)   : CV-AUC {kd_auc:.3f}   <- MATCHED-capacity temporal KV (full K, both states)")
             fair = hd_auc if hd_auc == hd_auc else (hpl_auc if hpl_auc == hpl_auc else hp_auc)
-            # Noise-aware verdict: require a SINGLE SCALAR KV signal to beat the fair baseline. Multi-feature
-            # combos (kv_combo/kvv_combo) overfit small-n noise, so they don't count for the verdict — a combo
-            # that clears the bar while every scalar sits below it is a false positive (the ffn case).
+            # Noise-aware verdict: require a KV signal (scalar OR the matched-capacity kv_DELTA vector probe)
+            # to beat the fair temporal-hidden baseline. Multi-feature scalar-combos overfit small-n noise.
             best_scalar = max(v for v in (kvs_auc, vs_auc, kvi_auc) if v == v)
             best_combo = max(v for v in (kvc_auc, kvv_auc) if v == v)
-            if best_scalar > fair + 0.02:
-                print(f"      -> best SCALAR KV ({best_scalar:.3f}) beats fair ({fair:.3f}) by >0.02 -> KEY-specific")
-                print(f"         signal genuinely beyond SkipGPT (not just temporality). Confirm w/ real-traj L2.")
-            elif best_combo > fair + 0.02:
-                print(f"      -> only the multi-feature COMBO ({best_combo:.3f}) clears fair ({fair:.3f}); every scalar")
-                print(f"         is below it -> likely combo-overfit noise (esp. vs fold sd {fold_sd:.3f}) -> treat as NO effect.")
+            best_vec = kd_auc                                            # the fair matched-capacity temporal KV
+            if best_vec == best_vec and best_vec > fair + 0.02:
+                print(f"      -> MATCHED temporal KV probe ({best_vec:.3f}) BEATS temporal hidden ({fair:.3f}) -> KV carries")
+                print(f"         convergence signal beyond the hidden AT EQUAL CAPACITY -> genuinely novel. (surprising!)")
+            elif best_scalar > fair + 0.02:
+                print(f"      -> a scalar KV ({best_scalar:.3f}) beats fair ({fair:.3f}) but matched kv_DELTA ({kd_auc:.3f})")
+                print(f"         does not -> likely a sample-efficiency effect, not a real capacity advantage.")
             else:
-                print(f"      -> no KV signal beats fair ({fair:.3f}) -> NO key-specific effect here.")
+                print(f"      -> nothing (incl. matched kv_DELTA {kd_auc:.3f}) beats temporal hidden ({fair:.3f}) -> hidden")
+                print(f"         subsumes KV on the CONVERGENCE axis too, at equal capacity -> direction closed on principle+data.")
     except ImportError:
         print("  [skipped: scikit-learn not installed -> `uv pip install scikit-learn` and rerun]")
 
