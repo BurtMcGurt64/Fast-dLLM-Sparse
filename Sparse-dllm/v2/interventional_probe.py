@@ -119,7 +119,9 @@ def probe_one(model, ids, n_prompt_blocks, device, layers, mask_early=0.7, mask_
                                  cross_kl=(kl_all.sum().item() - kl_all[t].item()) / (BLOCK - 1),
                                  stale_l2=float(stale_l2[t]), stale_kl=float(stale_kl[t]),
                                  settled=float(settled[t]), hnorm=float(hnorm[t])))
-    return rows
+    # Full late-hidden per token (SkipGPT's real router input) for the trained-probe baseline.
+    hidden_np = h_l[0].float().cpu().numpy().astype(np.float16)          # [T, D]
+    return rows, hidden_np
 
 
 def auc(score, label):
@@ -139,6 +141,32 @@ def spearman(a, b):
     if ra.std() == 0 or rb.std() == 0:
         return float("nan")
     return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def grouped_cv_auc(X, y, groups, n_pca=0, C=1.0):
+    """Example-held-out CV AUC for a logistic probe. groups = example id per row (leakage-safe:
+    tokens from the same block never span train/test). n_pca>0 => PCA-reduce first (for the
+    high-dim hidden probe). Returns (mean test AUC over folds, list of per-fold AUCs)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import roc_auc_score
+    X = np.asarray(X, float); y = np.asarray(y, int); groups = np.asarray(groups)
+    uniq = np.unique(groups)
+    if len(uniq) < 3 or y.min() == y.max():
+        return float("nan"), []
+    folds = np.array_split(uniq, min(5, len(uniq)))
+    aucs = []
+    for te_g in folds:
+        te = np.isin(groups, te_g); tr = ~te
+        if y[tr].min() == y[tr].max() or y[te].min() == y[te].max():
+            continue
+        sc = StandardScaler().fit(X[tr]); Xtr, Xte = sc.transform(X[tr]), sc.transform(X[te])
+        if n_pca and n_pca < Xtr.shape[1]:
+            pca = PCA(n_components=n_pca).fit(Xtr); Xtr, Xte = pca.transform(Xtr), pca.transform(Xte)
+        clf = LogisticRegression(C=C, max_iter=2000).fit(Xtr, y[tr])
+        aucs.append(roc_auc_score(y[te], clf.predict_proba(Xte)[:, 1]))
+    return (float(np.mean(aucs)) if aucs else float("nan")), aucs
 
 
 def main():
@@ -168,14 +196,20 @@ def main():
     win = args.prompt_blocks * BLOCK + BLOCK
 
     rows = []
+    hiddens = {}                                                         # (ex, tok) -> hidden vector
     for k in range(args.n):
         s = k * win
         if s + win > stream.shape[0]:
             break
-        r = probe_one(model, stream[s:s + win], args.prompt_blocks, args.device, layers, seed=args.seed + k)
-        for row in (r or []):
+        out = probe_one(model, stream[s:s + win], args.prompt_blocks, args.device, layers, seed=args.seed + k)
+        if out is None:
+            continue
+        r, hid = out
+        for row in r:
             row["ex"] = k
             rows.append(row)
+        for t in range(hid.shape[0]):
+            hiddens[(k, t)] = hid[t]
         print(f"  example {k+1}/{args.n} done ({len(rows)} intervention points)", flush=True)
 
     if not rows:
@@ -245,6 +279,39 @@ def main():
         for p in preds:
             lo, hi = boot_ci(grp, p)
             print(f"      {p:>9}: AUC {disc_auc(grp, p):.3f}  95%CI [{lo:.3f}, {hi:.3f}]")
+
+    # --- Table 4: THE GATE — does staleness beat a TRAINED probe on the full hidden (SkipGPT's real
+    #     router input)? And does a learned combo of ingredients beat hand-crafted KL? ---
+    print("\n  ============================ THE ROUTER GATE ============================")
+    print("  Example-held-out CV AUC. 'hidden_probe' = logistic on the FULL hidden vector (SkipGPT's")
+    print("  real router input, not just its norm). 'learned_scalar' = logistic on {kl,l2,hnorm,settled}.")
+    print("  DECISION: if stale_kl does NOT beat hidden_probe -> the convergence signal adds nothing over")
+    print("  SkipGPT -> router not novel. If learned_scalar >> stale_kl -> a learned combo beats hand-KL.\n")
+    try:
+        for mod in ("attn", "ffn"):
+            grp = [r for r in rows if r["mod"] == mod]
+            y = np.array([1 - r["local_flip"] for r in grp])            # 1 = skippable (argmax preserved)
+            groups = np.array([r["ex"] for r in grp])
+            # single-predictor CV AUC (direction-agnostic via best-sign, using the raw scalar)
+            def scalar_cv(key):
+                X = np.array([[r[key]] for r in grp]); a, _ = grouped_cv_auc(X, y, groups)
+                return max(a, 1 - a) if a == a else a
+            kl_auc = scalar_cv("stale_kl")
+            learned = np.array([[r["stale_kl"], r["stale_l2"], r["hnorm"], r["settled"]] for r in grp])
+            ls_auc, _ = grouped_cv_auc(learned, y, groups)
+            H = np.array([hiddens[(r["ex"], r["tok"])] for r in grp], dtype=np.float32)
+            hp_auc, _ = grouped_cv_auc(H, y, groups, n_pca=64)
+            print(f"    [{mod}]  skippable={y.mean():.0%}")
+            print(f"      stale_kl (hand)      : CV-AUC {kl_auc:.3f}")
+            print(f"      learned_scalar       : CV-AUC {ls_auc:.3f}   (combo of kl,l2,hnorm,settled)")
+            print(f"      hidden_probe (SkipGPT): CV-AUC {hp_auc:.3f}   (logistic on full hidden, PCA-64)")
+            if hp_auc == hp_auc and kl_auc == kl_auc:
+                verdict = ("staleness BEATS hidden -> convergence signal is NOVEL beyond SkipGPT"
+                           if kl_auc > hp_auc + 0.02 else
+                           "staleness ~<= hidden -> signal NOT clearly beyond SkipGPT (gate not passed)")
+                print(f"      -> {verdict}")
+    except ImportError:
+        print("  [skipped: scikit-learn not installed -> `uv pip install scikit-learn` and rerun]")
 
     print("\n  NOTE: L1 proxy — staleness is a 2-mask-level delta (not real consecutive-step ‖Δh‖), and damage")
     print("  is logit-argmax-flip vs a 25%-masked reference (not a full re-decode to ground truth). If the")
