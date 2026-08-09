@@ -97,11 +97,14 @@ def _norm_math(s):
 
 
 def _math_pred(text):
+    # the model often continues the few-shot with NEW hallucinated problems; keep only its
+    # answer to the REAL problem = everything before the next "Problem:", and take the FIRST box.
+    text = re.split(r"\bProblem\s*:", text)[0]
     boxes = re.findall(r"\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", text)
     if boxes:
-        return _norm_math(boxes[-1])
+        return _norm_math(boxes[0])
     nums = re.findall(r"-?[\d,]+(?:\.\d+)?", text)
-    return _norm_math(nums[-1]) if nums else None
+    return _norm_math(nums[-1]) if nums else None   # last number of the real solution = the answer
 
 
 def _load_gsm8k(n, seed):
